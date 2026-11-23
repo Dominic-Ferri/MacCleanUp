@@ -1,0 +1,1 @@
+a folder named like a disk image is not an installer

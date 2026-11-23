@@ -1,14 +1,18 @@
 //! Application state and background jobs, independent of drawing.
 
 use maccleanup::model::{format_bytes, AppItem, CleanItem, DiskItem, OperationResult};
+#[cfg(test)]
+use maccleanup::scanner::Size;
 use maccleanup::scanner::{
-    analyze_directory, is_protected_disk_path, scan_apps, scan_cleanup, scan_installers, ScanResult,
+    analyze_directory, is_protected_disk_path, scan_apps, scan_build_folders, scan_cleanup,
+    scan_installers, scan_large_files, DiskScan, ScanResult, SizeCache, LARGE_FILE_AGE,
+    LARGE_FILE_BYTES,
 };
-use maccleanup::system::{self, SystemStatus};
-use maccleanup::trash::{
-    related_app_data, trash_apps, trash_clean_items, trash_disk_item, trash_installers,
-};
+use maccleanup::system::{self, StorageExtras, SystemStatus};
+use maccleanup::trash::{related_app_data, trash_apps, trash_disk_item, trash_items};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -21,17 +25,22 @@ pub enum Section {
     Clean,
     Applications,
     Installers,
+    LargeFiles,
+    BuildFolders,
     Disk,
     Status,
     Activity,
 }
 
 impl Section {
-    pub const ALL: [Self; 7] = [
+    pub const COUNT: usize = 9;
+    pub const ALL: [Self; Self::COUNT] = [
         Self::Overview,
         Self::Clean,
         Self::Applications,
         Self::Installers,
+        Self::LargeFiles,
+        Self::BuildFolders,
         Self::Disk,
         Self::Status,
         Self::Activity,
@@ -43,6 +52,8 @@ impl Section {
             Self::Clean => "Caches and logs",
             Self::Applications => "Applications",
             Self::Installers => "Installer files",
+            Self::LargeFiles => "Large old files",
+            Self::BuildFolders => "Build folders",
             Self::Disk => "Disk map",
             Self::Status => "System",
             Self::Activity => "Activity",
@@ -53,8 +64,10 @@ impl Section {
         match self {
             Self::Overview => "Where your storage goes, and what you can safely clear.",
             Self::Clean => "Tick the items you want to clear, then move them to Trash.",
-            Self::Applications => "Uninstall moves the app and its exact caches and logs. Settings and documents stay.",
+            Self::Applications => "Uninstall moves the app and its exact caches and logs. Settings and app data move only if you tick them.",
             Self::Installers => "Disk images and packages left in Downloads, Desktop, Documents, Public, and iCloud Downloads.",
+            Self::LargeFiles => "Files of 1 GB or more, unchanged for 6 months, anywhere in your home folder outside Library.",
+            Self::BuildFolders => "Cargo target and npm node_modules folders in your projects. Your build tools make them again.",
             Self::Disk => "The largest items in a folder, drawn to scale. Double-click a folder to open it.",
             Self::Status => "Memory, storage, and load. Updates every 2 seconds.",
             Self::Activity => "Everything MacCleanUp moved to Trash since it opened.",
@@ -68,11 +81,20 @@ impl Section {
             .unwrap_or(0)
     }
 
-    /// Sections whose scans start without a click. Installers read Desktop,
-    /// Documents, and Downloads, and the disk map sizes whole folders; both
-    /// can raise macOS privacy prompts, so they wait for an explicit scan.
+    /// Sections whose scans start without a click. The searches read
+    /// Desktop, Documents, and Downloads, and the disk map sizes whole
+    /// folders; those can raise macOS privacy prompts, so they wait for an
+    /// explicit scan.
     fn loads_automatically(self) -> bool {
-        matches!(self, Self::Clean | Self::Applications)
+        matches!(self, Self::Clean | Self::Applications | Self::Status)
+    }
+
+    /// Sections whose rows are `CleanItem`s with a selection.
+    pub fn has_clean_items(self) -> bool {
+        matches!(
+            self,
+            Self::Clean | Self::Installers | Self::LargeFiles | Self::BuildFolders
+        )
     }
 }
 
@@ -88,6 +110,8 @@ pub enum SortKey {
 pub struct Busy {
     pub label: String,
     pub mutating: bool,
+    /// Sections this scan loads; a stopped scan leaves them unloaded.
+    pub sections: Vec<Section>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,9 +122,8 @@ pub struct Notice {
 
 #[derive(Clone, Debug)]
 pub enum PendingAction {
-    Clean,
+    Items(Section),
     Applications,
-    Installers,
     Disk(DiskItem, PathBuf),
 }
 
@@ -123,12 +146,15 @@ pub struct ActivityEntry {
     pub failed: bool,
 }
 
+type ItemScan = fn(&Path, &AtomicBool) -> ScanResult<CleanItem>;
+
 #[derive(Debug)]
 enum WorkerMessage {
-    Clean(u64, ScanResult<CleanItem>),
+    Items(u64, Section, ScanResult<CleanItem>),
     Applications(u64, ScanResult<AppItem>),
-    Installers(u64, ScanResult<CleanItem>),
-    Disk(u64, PathBuf, std::io::Result<Vec<DiskItem>>),
+    Overview(u64, ScanResult<CleanItem>, ScanResult<AppItem>),
+    Disk(u64, PathBuf, DiskScan),
+    Storage(u64, StorageExtras),
     Operation(u64, Section, Vec<(String, u64)>, OperationResult),
 }
 
@@ -140,26 +166,36 @@ pub struct State {
     pub clean_items: Vec<CleanItem>,
     pub app_items: Vec<AppItem>,
     pub installer_items: Vec<CleanItem>,
+    pub large_items: Vec<CleanItem>,
+    pub build_items: Vec<CleanItem>,
+    /// Installed app names by lowercased bundle ID, for cache folder names.
+    pub app_names: HashMap<String, String>,
     pub disk_items: Vec<DiskItem>,
     pub disk_root: PathBuf,
     /// Index of the item shown in the inspector, per section.
-    pub focus: [Option<usize>; 7],
-    pub sort: [SortKey; 7],
-    pub filter: [String; 7],
+    pub focus: [Option<usize>; Section::COUNT],
+    pub sort: [SortKey; Section::COUNT],
+    pub filter: [String; Section::COUNT],
     pub status: Option<SystemStatus>,
+    pub extras: Option<StorageExtras>,
     pub message: String,
     pub busy: Option<Busy>,
     pub confirmation: Option<Confirmation>,
     pub notice: Option<Notice>,
-    pub scan_errors: [Vec<String>; 7],
+    pub scan_errors: [Vec<String>; Section::COUNT],
     pub activity: Vec<ActivityEntry>,
     pub path_draft: String,
-    loaded: [bool; 7],
+    /// Folder sizes the disk map already measured, shared with workers.
+    pub size_cache: Arc<SizeCache>,
+    loaded: [bool; Section::COUNT],
+    /// Set when the person stops a scan, so it does not restart by itself.
+    stopped: [bool; Section::COUNT],
     status_read_at: Option<Instant>,
     operation_summary: Option<String>,
     sender: Sender<WorkerMessage>,
     receiver: Receiver<WorkerMessage>,
     generation: u64,
+    cancel: Arc<AtomicBool>,
     waker: Option<Waker>,
 }
 
@@ -174,23 +210,30 @@ impl State {
             clean_items: Vec::new(),
             app_items: Vec::new(),
             installer_items: Vec::new(),
+            large_items: Vec::new(),
+            build_items: Vec::new(),
+            app_names: HashMap::new(),
             disk_items: Vec::new(),
-            focus: [None; 7],
-            sort: [SortKey::Size; 7],
+            focus: [None; Section::COUNT],
+            sort: [SortKey::Size; Section::COUNT],
             filter: Default::default(),
             status: None,
+            extras: None,
             message: "Nothing moves until you review it.".to_string(),
             busy: None,
             confirmation: None,
             notice: None,
             scan_errors: Default::default(),
             activity: Vec::new(),
-            loaded: [false; 7],
+            size_cache: Arc::default(),
+            loaded: [false; Section::COUNT],
+            stopped: [false; Section::COUNT],
             status_read_at: None,
             operation_summary: None,
             sender,
             receiver,
             generation: 0,
+            cancel: Arc::default(),
             waker: None,
         }
     }
@@ -204,6 +247,10 @@ impl State {
         self.loaded[section.index()]
     }
 
+    pub fn is_stopped(&self, section: Section) -> bool {
+        self.stopped[section.index()]
+    }
+
     pub fn select_section(&mut self, section: Section) {
         if section != self.section && !self.message.starts_with("Moved") {
             // Scan counts belong to the view that produced them; Trash
@@ -211,6 +258,31 @@ impl State {
             self.message.clear();
         }
         self.section = section;
+    }
+
+    /// The `CleanItem` list behind a section, if it has one.
+    pub fn items(&self, section: Section) -> Option<&Vec<CleanItem>> {
+        match section {
+            Section::Clean => Some(&self.clean_items),
+            Section::Installers => Some(&self.installer_items),
+            Section::LargeFiles => Some(&self.large_items),
+            Section::BuildFolders => Some(&self.build_items),
+            _ => None,
+        }
+    }
+
+    fn items_mut(&mut self, section: Section) -> Option<&mut Vec<CleanItem>> {
+        match section {
+            Section::Clean => Some(&mut self.clean_items),
+            Section::Installers => Some(&mut self.installer_items),
+            Section::LargeFiles => Some(&mut self.large_items),
+            Section::BuildFolders => Some(&mut self.build_items),
+            _ => None,
+        }
+    }
+
+    fn wants_auto_load(&self, section: Section) -> bool {
+        !self.is_loaded(section) && !self.is_stopped(section)
     }
 
     /// Runs every frame: loads automatic sections once no job is running and
@@ -226,17 +298,17 @@ impl State {
             self.read_status();
         }
         if self.busy.is_none() {
-            let pending = match self.section {
-                Section::Overview => [Section::Clean, Section::Applications]
-                    .into_iter()
-                    .find(|section| !self.is_loaded(*section)),
-                section if section.loads_automatically() && !self.is_loaded(section) => {
-                    Some(section)
+            if self.section == Section::Overview {
+                let clean = self.wants_auto_load(Section::Clean);
+                let apps = self.wants_auto_load(Section::Applications);
+                match (clean, apps) {
+                    (true, true) => self.scan_overview(),
+                    (true, false) => self.start_scan(Section::Clean),
+                    (false, true) => self.start_scan(Section::Applications),
+                    (false, false) => {}
                 }
-                _ => None,
-            };
-            if let Some(section) = pending {
-                self.scan(section);
+            } else if self.section.loads_automatically() && self.wants_auto_load(self.section) {
+                self.start_scan(self.section);
             }
         }
         if self.busy.is_some() {
@@ -257,34 +329,81 @@ impl State {
         self.busy.is_none()
     }
 
-    /// Starts the scan for `section`. Ignored while another job runs.
+    /// Starts the scan for `section` at the person's request. Ignored while
+    /// another job runs.
     pub fn scan(&mut self, section: Section) {
+        if !self.can_start() {
+            return;
+        }
+        self.stopped[section.index()] = false;
+        if section == Section::Disk {
+            // "Measure again" means fresh numbers, not remembered ones.
+            self.size_cache = Arc::default();
+        }
+        self.start_scan(section);
+    }
+
+    fn start_scan(&mut self, section: Section) {
         if !self.can_start() {
             return;
         }
         self.loaded[section.index()] = true;
         let home = self.home.clone();
+        let list: Option<(&str, ItemScan)> = match section {
+            Section::Clean => Some(("Scanning caches and logs", scan_cleanup)),
+            Section::Installers => Some(("Looking for installer files", scan_installers)),
+            Section::LargeFiles => Some(("Looking for large old files", |home, cancel| {
+                scan_large_files(home, LARGE_FILE_BYTES, LARGE_FILE_AGE, cancel)
+            })),
+            Section::BuildFolders => Some(("Looking for build folders", scan_build_folders)),
+            _ => None,
+        };
+        if let Some((label, scan)) = list {
+            self.spawn(label, vec![section], move |generation, cancel| {
+                WorkerMessage::Items(generation, section, scan(&home, cancel))
+            });
+            return;
+        }
         match section {
-            Section::Clean => self.spawn("Scanning caches and logs", false, move |generation| {
-                WorkerMessage::Clean(generation, scan_cleanup(&home))
-            }),
-            Section::Applications => {
-                self.spawn("Measuring installed apps", false, move |generation| {
-                    WorkerMessage::Applications(generation, scan_apps(&home))
-                })
-            }
-            Section::Installers => {
-                self.spawn("Looking for installer files", false, move |generation| {
-                    WorkerMessage::Installers(generation, scan_installers(&home))
-                })
-            }
+            Section::Applications => self.spawn(
+                "Measuring installed apps",
+                vec![section],
+                move |generation, cancel| {
+                    WorkerMessage::Applications(generation, scan_apps(&home, cancel))
+                },
+            ),
             Section::Disk => self.open_folder(self.disk_root.clone()),
             Section::Status => {
                 self.read_status();
-                self.message = "System metrics refreshed.".to_string();
+                self.spawn(
+                    "Reading Trash and snapshots",
+                    vec![section],
+                    move |generation, cancel| {
+                        WorkerMessage::Storage(generation, system::storage_extras(&home, cancel))
+                    },
+                );
             }
-            Section::Overview | Section::Activity => {}
+            _ => {}
         }
+    }
+
+    /// Scans caches and apps at the same time.
+    fn scan_overview(&mut self) {
+        let home = self.home.clone();
+        self.loaded[Section::Clean.index()] = true;
+        self.loaded[Section::Applications.index()] = true;
+        self.spawn(
+            "Scanning caches and apps",
+            vec![Section::Clean, Section::Applications],
+            move |generation, cancel| {
+                let (clean, apps) = std::thread::scope(|scope| {
+                    let apps = scope.spawn(|| scan_apps(&home, cancel));
+                    let clean = scan_cleanup(&home, cancel);
+                    (clean, apps.join().unwrap_or_default())
+                });
+                WorkerMessage::Overview(generation, clean, apps)
+            },
+        );
     }
 
     pub fn open_folder(&mut self, root: PathBuf) {
@@ -294,13 +413,15 @@ impl State {
         // Clear the old listing so a cancelled scan never shows one folder's
         // entries under another folder's path.
         self.loaded[Section::Disk.index()] = true;
+        self.stopped[Section::Disk.index()] = false;
         self.disk_items.clear();
         self.focus[Section::Disk.index()] = None;
         self.path_draft = tilde_path(&root, &self.home);
         self.disk_root = root.clone();
         let label = format!("Measuring {}", tilde_path(&root, &self.home));
-        self.spawn(label, false, move |generation| {
-            let result = analyze_directory(&root);
+        let cache = Arc::clone(&self.size_cache);
+        self.spawn(label, vec![Section::Disk], move |generation, cancel| {
+            let result = analyze_directory(&root, &cache, cancel);
             WorkerMessage::Disk(generation, root, result)
         });
     }
@@ -328,11 +449,16 @@ impl State {
     }
 
     pub fn cancel_scan(&mut self) {
-        if !self.busy.as_ref().is_some_and(|busy| !busy.mutating) {
+        let Some(busy) = self.busy.as_ref().filter(|busy| !busy.mutating) else {
             return;
-        }
-        // The worker finishes in the background; its result carries the old
+        };
+        // The walk stops at its next folder; its result carries the old
         // generation and is discarded.
+        self.cancel.store(true, Ordering::Relaxed);
+        for section in busy.sections.clone() {
+            self.loaded[section.index()] = false;
+            self.stopped[section.index()] = true;
+        }
         self.generation += 1;
         self.busy = None;
         self.message = match self.operation_summary.take() {
@@ -346,20 +472,30 @@ impl State {
         !self.busy.as_ref().is_some_and(|busy| busy.mutating)
     }
 
-    fn spawn<F>(&mut self, label: impl Into<String>, mutating: bool, work: F)
+    fn spawn<F>(&mut self, label: impl Into<String>, sections: Vec<Section>, work: F)
     where
-        F: FnOnce(u64) -> WorkerMessage + Send + 'static,
+        F: FnOnce(u64, &AtomicBool) -> WorkerMessage + Send + 'static,
+    {
+        self.start_job(label.into(), false, sections, work);
+    }
+
+    fn start_job<F>(&mut self, label: String, mutating: bool, sections: Vec<Section>, work: F)
+    where
+        F: FnOnce(u64, &AtomicBool) -> WorkerMessage + Send + 'static,
     {
         self.generation += 1;
         let generation = self.generation;
         let sender = self.sender.clone();
         let waker = self.waker.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Arc::clone(&cancel);
         self.busy = Some(Busy {
-            label: label.into(),
+            label,
             mutating,
+            sections,
         });
         std::thread::spawn(move || {
-            let _ = sender.send(work(generation));
+            let _ = sender.send(work(generation, &cancel));
             if let Some(waker) = waker {
                 waker();
             }
@@ -369,51 +505,38 @@ impl State {
     pub fn poll_worker(&mut self) {
         while let Ok(message) = self.receiver.try_recv() {
             let generation = match &message {
-                WorkerMessage::Clean(generation, _)
+                WorkerMessage::Items(generation, ..)
                 | WorkerMessage::Applications(generation, _)
-                | WorkerMessage::Installers(generation, _)
-                | WorkerMessage::Disk(generation, _, _)
-                | WorkerMessage::Operation(generation, _, _, _) => *generation,
+                | WorkerMessage::Overview(generation, ..)
+                | WorkerMessage::Disk(generation, ..)
+                | WorkerMessage::Storage(generation, _)
+                | WorkerMessage::Operation(generation, ..) => *generation,
             };
             if generation != self.generation {
                 continue;
             }
             self.busy = None;
             let message = match message {
-                WorkerMessage::Clean(_, result) => {
-                    self.clean_items = result.items;
-                    self.finish_scan(Section::Clean, self.clean_items.len(), result.errors)
-                }
-                WorkerMessage::Applications(_, result) => {
-                    self.app_items = result.items;
-                    self.finish_scan(Section::Applications, self.app_items.len(), result.errors)
-                }
-                WorkerMessage::Installers(_, result) => {
-                    self.installer_items = result.items;
-                    self.finish_scan(
-                        Section::Installers,
-                        self.installer_items.len(),
-                        result.errors,
-                    )
-                }
-                WorkerMessage::Disk(_, root, result) => match result {
-                    Ok(items) => {
-                        self.disk_items = items;
-                        self.focus[Section::Disk.index()] =
-                            (!self.disk_items.is_empty()).then_some(0);
-                        self.scan_errors[Section::Disk.index()].clear();
-                        format!(
-                            "{} in {}.",
-                            plural(self.disk_items.len(), "item", "items"),
-                            tilde_path(&root, &self.home)
-                        )
+                WorkerMessage::Items(_, section, result) => {
+                    let count = result.items.len();
+                    if let Some(items) = self.items_mut(section) {
+                        *items = result.items;
                     }
-                    Err(error) => {
-                        self.disk_items.clear();
-                        self.focus[Section::Disk.index()] = None;
-                        format!("Cannot open {}: {error}", tilde_path(&root, &self.home))
-                    }
-                },
+                    self.finish_scan(section, count, result.errors)
+                }
+                WorkerMessage::Applications(_, result) => self.finish_apps(result),
+                WorkerMessage::Overview(_, clean, apps) => {
+                    let count = clean.items.len();
+                    self.clean_items = clean.items;
+                    let clean = self.finish_scan(Section::Clean, count, clean.errors);
+                    let apps = self.finish_apps(apps);
+                    format!("Caches: {clean} Apps: {apps}")
+                }
+                WorkerMessage::Disk(_, root, result) => self.finish_disk(&root, result),
+                WorkerMessage::Storage(_, extras) => {
+                    self.extras = Some(extras);
+                    "System metrics refreshed.".to_string()
+                }
                 WorkerMessage::Operation(_, section, moves, result) => {
                     self.finish_operation(section, moves, result);
                     continue;
@@ -425,6 +548,42 @@ impl State {
                 Some(summary) => format!("{summary} List refreshed."),
                 None => message,
             };
+        }
+    }
+
+    fn finish_apps(&mut self, result: ScanResult<AppItem>) -> String {
+        self.app_items = result.items;
+        self.app_names = app_names(&self.app_items);
+        self.finish_scan(Section::Applications, self.app_items.len(), result.errors)
+    }
+
+    fn finish_disk(&mut self, root: &Path, result: DiskScan) -> String {
+        let index = Section::Disk.index();
+        match result {
+            Ok((scan, folders)) => {
+                self.disk_items = scan.items;
+                Arc::make_mut(&mut self.size_cache).extend(folders);
+                self.focus[index] = (!self.disk_items.is_empty()).then_some(0);
+                let mut text = format!(
+                    "{} in {}",
+                    plural(self.disk_items.len(), "item", "items"),
+                    tilde_path(root, &self.home)
+                );
+                if !scan.errors.is_empty() {
+                    text.push_str(&format!(
+                        "; {} could not be read",
+                        plural(scan.errors.len(), "item", "items")
+                    ));
+                }
+                self.scan_errors[index] = scan.errors;
+                text + "."
+            }
+            Err(error) => {
+                self.disk_items.clear();
+                self.focus[index] = None;
+                self.scan_errors[index].clear();
+                format!("Cannot open {}: {error}", tilde_path(root, &self.home))
+            }
         }
     }
 
@@ -443,6 +602,23 @@ impl State {
         };
         self.scan_errors[index] = errors;
         text
+    }
+
+    /// Forgets remembered sizes of the moved paths, what was inside them,
+    /// and every folder that contained them.
+    fn invalidate(&mut self, moved: &[PathBuf]) {
+        if moved.is_empty() {
+            return;
+        }
+        Arc::make_mut(&mut self.size_cache).retain(|cached, _| {
+            !moved
+                .iter()
+                .any(|path| path.starts_with(cached) || cached.starts_with(path))
+        });
+        for app in &mut self.app_items {
+            app.related.retain(|related| !moved.contains(&related.path));
+            app.data.retain(|data| !moved.contains(&data.path));
+        }
     }
 
     fn finish_operation(
@@ -482,21 +658,29 @@ impl State {
                 failed: !result.failures.is_empty(),
             },
         );
+        self.invalidate(&result.moved_paths);
         self.message = summary.clone();
+        if section == Section::Disk {
+            // Only the moved item changed, so drop it instead of measuring
+            // the whole folder again.
+            self.disk_items
+                .retain(|item| !result.moved_paths.contains(&item.path));
+            let index = Section::Disk.index();
+            self.focus[index] = self.focus[index].filter(|focus| *focus < self.disk_items.len());
+            return;
+        }
         self.operation_summary = Some(summary);
-        // Rescan the list the operation changed, even if the user switched
+        // Rescan the list the operation changed, even if the person switched
         // sections while it ran.
         self.scan(section);
     }
 
     pub fn len(&self, section: Section) -> usize {
         match section {
-            Section::Clean => self.clean_items.len(),
             Section::Applications => self.app_items.len(),
-            Section::Installers => self.installer_items.len(),
             Section::Disk => self.disk_items.len(),
             Section::Activity => self.activity.len(),
-            Section::Overview | Section::Status => 0,
+            section => self.items(section).map_or(0, Vec::len),
         }
     }
 
@@ -508,44 +692,51 @@ impl State {
         self.focus[self.section.index()] = Some(index);
     }
 
+    pub fn is_selected(&self, index: usize) -> bool {
+        match self.section {
+            Section::Applications => self.app_items.get(index).is_some_and(|app| app.selected),
+            section => self
+                .items(section)
+                .and_then(|items| items.get(index))
+                .is_some_and(|item| item.selected),
+        }
+    }
+
     /// Selectable lists for the current section. Disk items are reviewed one
     /// at a time, so they have no selection.
     pub fn toggle(&mut self, index: usize) {
         match self.section {
-            Section::Clean => toggle_one(&mut self.clean_items, index, |item| &mut item.selected),
             Section::Applications => {
-                toggle_one(&mut self.app_items, index, |item| &mut item.selected)
+                if let Some(app) = self.app_items.get_mut(index) {
+                    app.selected = !app.selected;
+                }
             }
-            Section::Installers => {
-                toggle_one(&mut self.installer_items, index, |item| &mut item.selected)
+            section => {
+                if let Some(item) = self
+                    .items_mut(section)
+                    .and_then(|items| items.get_mut(index))
+                {
+                    item.selected = !item.selected;
+                }
             }
-            _ => {}
+        }
+    }
+
+    /// Ticks or clears "also move settings and app data" for one app.
+    pub fn toggle_app_data(&mut self, index: usize) {
+        if let Some(app) = self.app_items.get_mut(index) {
+            app.include_data = !app.include_data;
         }
     }
 
     /// Selects every item in `indices` unless all are already selected, in
     /// which case it clears them.
     pub fn toggle_all(&mut self, indices: &[usize]) {
-        fn apply<T>(items: &mut [T], indices: &[usize], flag: impl Fn(&mut T) -> &mut bool) {
-            let mut select = false;
-            for &index in indices {
-                if let Some(item) = items.get_mut(index) {
-                    select |= !*flag(item);
-                }
+        let select = indices.iter().any(|&index| !self.is_selected(index));
+        for &index in indices {
+            if self.is_selected(index) != select {
+                self.toggle(index);
             }
-            for &index in indices {
-                if let Some(item) = items.get_mut(index) {
-                    *flag(item) = select;
-                }
-            }
-        }
-        match self.section {
-            Section::Clean => apply(&mut self.clean_items, indices, |item| &mut item.selected),
-            Section::Applications => apply(&mut self.app_items, indices, |item| &mut item.selected),
-            Section::Installers => apply(&mut self.installer_items, indices, |item| {
-                &mut item.selected
-            }),
-            _ => {}
         }
     }
 
@@ -554,22 +745,17 @@ impl State {
             items.fold((0, 0), |(count, bytes), item| (count + 1, bytes + item))
         };
         match section {
-            Section::Clean => sum(&mut self
-                .clean_items
-                .iter()
-                .filter(|item| item.selected)
-                .map(|item| item.bytes)),
             Section::Applications => sum(&mut self
                 .app_items
                 .iter()
                 .filter(|item| item.selected)
                 .map(|item| item.bytes)),
-            Section::Installers => sum(&mut self
-                .installer_items
-                .iter()
-                .filter(|item| item.selected)
-                .map(|item| item.bytes)),
-            _ => (0, 0),
+            section => self.items(section).map_or((0, 0), |items| {
+                sum(&mut items
+                    .iter()
+                    .filter(|item| item.selected)
+                    .map(|item| item.bytes))
+            }),
         }
     }
 
@@ -581,53 +767,23 @@ impl State {
         let home = self.home.clone();
         let tilde = |path: &Path| tilde_path(path, &home);
         let confirmation = match self.section {
-            Section::Clean | Section::Installers => {
-                let installers = self.section == Section::Installers;
-                let items = if installers {
-                    &self.installer_items
-                } else {
-                    &self.clean_items
-                };
-                let moves: Vec<_> = items
-                    .iter()
-                    .filter(|item| item.selected)
-                    .map(|item| (tilde(&item.path), item.bytes))
-                    .collect();
-                if moves.is_empty() {
-                    self.message = "Select at least one item first.".to_string();
-                    return;
-                }
-                Confirmation {
-                    title: format!("Move {} to Trash?", plural(moves.len(), "item", "items")),
-                    button: "Move to Trash".to_string(),
-                    notes: vec![if installers {
-                        "Installed apps keep working without their installers.".to_string()
-                    } else {
-                        "Apps rebuild caches when they need them. Close an app first if you are clearing its cache.".to_string()
-                    }],
-                    moves,
-                    action: if installers {
-                        PendingAction::Installers
-                    } else {
-                        PendingAction::Clean
-                    },
-                }
-            }
             Section::Applications => {
                 let mut moves = Vec::new();
                 let mut notes = Vec::new();
+                let mut with_data = false;
                 for app in self.app_items.iter().filter(|app| app.selected) {
                     moves.push((tilde(&app.path), app.bytes));
-                    let related = related_app_data(&self.app_items, app, &home);
+                    let related = related_app_data(&self.app_items, app);
                     moves.extend(
                         related
                             .paths
                             .iter()
-                            .map(|(path, bytes)| (tilde(path), *bytes)),
+                            .map(|related| (tilde(&related.path), related.bytes)),
                     );
+                    with_data |= app.include_data && !related.kept_shared;
                     if related.kept_shared {
                         notes.push(format!(
-                            "{} shares caches with another installed copy, so they stay.",
+                            "{} shares caches and app data with another installed copy, so they stay.",
                             app.name
                         ));
                     }
@@ -636,7 +792,11 @@ impl State {
                     self.message = "Select at least one app first.".to_string();
                     return;
                 }
-                notes.push("Settings, documents, and other personal data stay.".to_string());
+                notes.push(if with_data {
+                    "Settings and app data move too for the apps where you ticked them. Documents stay.".to_string()
+                } else {
+                    "Settings, documents, and other personal data stay.".to_string()
+                });
                 notes.push("Quit an app before you uninstall it.".to_string());
                 let apps = self.app_items.iter().filter(|app| app.selected).count();
                 Confirmation {
@@ -674,7 +834,33 @@ impl State {
                     action: PendingAction::Disk(item.clone(), self.disk_root.clone()),
                 }
             }
-            _ => return,
+            section => {
+                let Some(items) = self.items(section) else {
+                    return;
+                };
+                let moves: Vec<_> = items
+                    .iter()
+                    .filter(|item| item.selected)
+                    .map(|item| (tilde(&item.path), item.bytes))
+                    .collect();
+                if moves.is_empty() {
+                    self.message = "Select at least one item first.".to_string();
+                    return;
+                }
+                let note = match section {
+                    Section::Installers => "Installed apps keep working without their installers.",
+                    Section::LargeFiles => "Check each file before you move it. MacCleanUp cannot tell whether you still need it.",
+                    Section::BuildFolders => "The projects' source code stays. Build again to make these folders again.",
+                    _ => "Apps rebuild caches when they need them. Close an app first if you are clearing its cache.",
+                };
+                Confirmation {
+                    title: format!("Move {} to Trash?", plural(moves.len(), "item", "items")),
+                    button: "Move to Trash".to_string(),
+                    notes: vec![note.to_string()],
+                    moves,
+                    action: PendingAction::Items(section),
+                }
+            }
         };
         self.confirmation = Some(confirmation);
     }
@@ -694,20 +880,20 @@ impl State {
         let home = self.home.clone();
         let moves = confirmation.moves;
         let (label, section): (&str, Section) = match &confirmation.action {
-            PendingAction::Clean => ("Moving caches and logs to Trash", Section::Clean),
+            PendingAction::Items(Section::Clean) => {
+                ("Moving caches and logs to Trash", Section::Clean)
+            }
+            PendingAction::Items(section) => ("Moving items to Trash", *section),
             PendingAction::Applications => ("Moving apps to Trash", Section::Applications),
-            PendingAction::Installers => ("Moving installers to Trash", Section::Installers),
             PendingAction::Disk(..) => ("Moving item to Trash", Section::Disk),
         };
-        let clean = self.clean_items.clone();
+        let items = self.items(section).cloned().unwrap_or_default();
         let apps = self.app_items.clone();
-        let installers = self.installer_items.clone();
         let action = confirmation.action;
-        self.spawn(label, true, move |generation| {
+        self.start_job(label.to_string(), true, Vec::new(), move |generation, _| {
             let result = match action {
-                PendingAction::Clean => trash_clean_items(&clean, &home),
+                PendingAction::Items(_) => trash_items(&items, &home),
                 PendingAction::Applications => trash_apps(&apps, &home),
-                PendingAction::Installers => trash_installers(&installers, &home),
                 PendingAction::Disk(item, root) => trash_disk_item(&item, &root, &home),
             };
             WorkerMessage::Operation(generation, section, moves, result)
@@ -720,11 +906,11 @@ impl State {
     }
 }
 
-fn toggle_one<T>(items: &mut [T], index: usize, flag: impl Fn(&mut T) -> &mut bool) {
-    if let Some(item) = items.get_mut(index) {
-        let value = flag(item);
-        *value = !*value;
-    }
+/// Installed app names by lowercased bundle ID.
+pub fn app_names(apps: &[AppItem]) -> HashMap<String, String> {
+    apps.iter()
+        .filter_map(|app| Some((app.bundle_id.as_ref()?.to_lowercase(), app.name.clone())))
+        .collect()
 }
 
 pub fn plural(count: usize, one: &str, many: &str) -> String {
@@ -762,6 +948,7 @@ pub fn age(modified: Option<SystemTime>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maccleanup::model::RelatedPath;
 
     fn fixture_home() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/home")
@@ -779,35 +966,65 @@ mod tests {
     }
 
     #[test]
-    fn overview_loads_caches_then_apps_but_not_private_folders() {
+    fn overview_scans_caches_and_apps_together_but_not_private_folders() {
         let mut state = State::new(fixture_home());
         state.update();
         assert_eq!(
             state.busy.as_ref().unwrap().label,
-            "Scanning caches and logs"
+            "Scanning caches and apps"
         );
         wait_idle(&mut state);
         assert_eq!(state.clean_items.len(), 5);
+        assert!(state.is_loaded(Section::Clean) && state.is_loaded(Section::Applications));
         state.update();
-        assert!(state.busy.is_some(), "apps scan follows");
-        wait_idle(&mut state);
-        state.update();
-        assert!(state.busy.is_none());
+        assert!(state.busy.is_none(), "nothing else starts on its own");
         assert!(!state.is_loaded(Section::Installers));
+        assert!(!state.is_loaded(Section::LargeFiles));
+        assert!(!state.is_loaded(Section::BuildFolders));
         assert!(!state.is_loaded(Section::Disk));
         assert!(state.status.is_some());
-        state.select_section(Section::Installers);
-        state.update();
-        assert!(state.busy.is_none(), "installers wait for an explicit scan");
+        for section in [
+            Section::Installers,
+            Section::LargeFiles,
+            Section::BuildFolders,
+        ] {
+            state.select_section(section);
+            state.update();
+            assert!(
+                state.busy.is_none(),
+                "{section:?} waits for an explicit scan"
+            );
+        }
         state.scan(Section::Installers);
         wait_idle(&mut state);
-        assert_eq!(state.installer_items.len(), 3);
+        assert_eq!(state.installer_items.len(), 4);
+        state.scan(Section::BuildFolders);
+        wait_idle(&mut state);
+        assert_eq!(state.build_items.len(), 2);
+    }
+
+    #[test]
+    fn a_stopped_scan_stays_stopped_until_the_person_scans_again() {
+        let mut state = State::new(fixture_home());
+        state.update();
+        let cancel = Arc::clone(&state.cancel);
+        state.cancel_scan();
+        assert!(cancel.load(Ordering::Relaxed), "the walk is told to stop");
+        assert!(!state.is_loaded(Section::Clean));
+        assert!(!state.is_loaded(Section::Applications));
+        assert!(state.is_stopped(Section::Clean));
+        state.update();
+        assert!(state.busy.is_none(), "the overview does not restart it");
+        state.scan(Section::Clean);
+        assert!(!state.is_stopped(Section::Clean));
+        wait_idle(&mut state);
+        assert!(state.is_loaded(Section::Clean));
     }
 
     #[test]
     fn operation_keeps_summary_rescans_origin_and_logs_activity() {
         let mut state = State::new(fixture_home());
-        state.section = Section::Status;
+        state.section = Section::Activity;
         state.inject_operation(
             Section::Installers,
             OperationResult {
@@ -818,7 +1035,7 @@ mod tests {
         );
         assert!(state.busy.is_some(), "installer rescan started");
         wait_idle(&mut state);
-        assert_eq!(state.installer_items.len(), 3);
+        assert_eq!(state.installer_items.len(), 4);
         assert_eq!(
             state.message,
             "Moved 2 items (2.00 KB) to Trash. List refreshed."
@@ -848,6 +1065,7 @@ mod tests {
         state.busy = Some(Busy {
             label: "Moving".to_string(),
             mutating: true,
+            sections: Vec::new(),
         });
         let generation = state.generation;
         state.scan(Section::Clean);
@@ -859,6 +1077,7 @@ mod tests {
         state.busy = Some(Busy {
             label: "Scanning".to_string(),
             mutating: false,
+            sections: vec![Section::Clean],
         });
         state.cancel_scan();
         assert!(state.busy.is_none());
@@ -876,7 +1095,79 @@ mod tests {
         state.open_folder(home.join("Library"));
         state.cancel_scan();
         assert!(state.disk_items.is_empty());
+        assert!(!state.is_loaded(Section::Disk));
         assert_eq!(state.disk_root, home.join("Library"));
+    }
+
+    #[test]
+    fn disk_map_reuses_measured_folders_until_something_moves() {
+        let home = fixture_home();
+        let library = home.join("Library");
+        let mut state = State::new(home.clone());
+        Arc::make_mut(&mut state.size_cache).insert(
+            library.clone(),
+            Size {
+                bytes: 987_654,
+                complete: true,
+            },
+        );
+        state.open_folder(home.clone());
+        wait_idle(&mut state);
+        let size = |state: &State| {
+            state
+                .disk_items
+                .iter()
+                .find(|item| item.path == library)
+                .unwrap()
+                .bytes
+        };
+        assert_eq!(size(&state), 987_654, "remembered size used");
+        assert!(
+            state.size_cache.contains_key(&home),
+            "the opened folder is remembered"
+        );
+
+        state.inject_operation(
+            Section::Installers,
+            OperationResult {
+                moved: 1,
+                moved_paths: vec![library.join("Caches/com.example.gone")],
+                ..OperationResult::default()
+            },
+        );
+        assert!(!state.size_cache.contains_key(&library));
+        assert!(!state.size_cache.contains_key(&home));
+        wait_idle(&mut state);
+        state.open_folder(home.clone());
+        wait_idle(&mut state);
+        assert_ne!(size(&state), 987_654);
+
+        Arc::make_mut(&mut state.size_cache).insert(library.clone(), Size::default());
+        state.scan(Section::Disk);
+        assert!(state.size_cache.is_empty(), "Measure again forgets sizes");
+        wait_idle(&mut state);
+    }
+
+    #[test]
+    fn a_disk_map_move_drops_the_item_without_measuring_again() {
+        let home = fixture_home();
+        let mut state = State::new(home.clone());
+        state.open_folder(home.join("Library"));
+        wait_idle(&mut state);
+        let moved = home.join("Library/Logs");
+        assert!(state.disk_items.iter().any(|item| item.path == moved));
+        let count = state.disk_items.len();
+        state.inject_operation(
+            Section::Disk,
+            OperationResult {
+                moved: 1,
+                moved_paths: vec![moved.clone()],
+                ..OperationResult::default()
+            },
+        );
+        assert!(state.busy.is_none(), "no rescan");
+        assert_eq!(state.disk_items.len(), count - 1);
+        assert!(!state.disk_items.iter().any(|item| item.path == moved));
     }
 
     #[test]
@@ -887,7 +1178,7 @@ mod tests {
         state.open_typed_folder();
         assert_eq!(state.disk_root, home.join("Library"));
         wait_idle(&mut state);
-        assert_eq!(state.disk_items.len(), 3);
+        assert_eq!(state.disk_items.len(), 5);
         state.path_draft = "relative/path".to_string();
         state.open_typed_folder();
         assert!(state.busy.is_none());
@@ -915,7 +1206,7 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_review_lists_the_same_caches_the_operation_moves() {
+    fn uninstall_review_lists_the_same_paths_the_operation_moves() {
         let home = fixture_home();
         let mut state = State::new(home.clone());
         state.section = Section::Applications;
@@ -926,19 +1217,41 @@ mod tests {
             path: home.join("Applications/Example.app"),
             bytes: 100,
             selected: true,
-            identity: None,
-            modified: None,
+            related: vec![RelatedPath {
+                path: home.join("Library/Caches/com.example.alpha"),
+                bytes: 10,
+                identity: None,
+            }],
+            data: vec![RelatedPath {
+                path: home.join("Library/Preferences/com.example.alpha.plist"),
+                bytes: 4,
+                identity: None,
+            }],
+            ..AppItem::default()
         }];
         state.review();
-        let confirmation = state.confirmation.as_ref().unwrap();
-        let paths: Vec<_> = confirmation
-            .moves
-            .iter()
-            .map(|(path, _)| path.as_str())
-            .collect();
-        assert_eq!(paths.len(), 2);
-        assert!(paths[1].ends_with("Library/Caches/com.example.alpha"));
-        assert_eq!(confirmation.title, "Uninstall 1 app?");
+        let paths = |state: &State| -> Vec<String> {
+            state
+                .confirmation
+                .as_ref()
+                .unwrap()
+                .moves
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect()
+        };
+        assert_eq!(paths(&state).len(), 2);
+        assert!(paths(&state)[1].ends_with("Library/Caches/com.example.alpha"));
+        assert_eq!(
+            state.confirmation.as_ref().unwrap().title,
+            "Uninstall 1 app?"
+        );
+        state.cancel_confirmation();
+
+        state.toggle_app_data(0);
+        state.review();
+        assert_eq!(paths(&state).len(), 3);
+        assert!(paths(&state)[2].ends_with("Preferences/com.example.alpha.plist"));
         state.cancel_confirmation();
         assert!(state.confirmation.is_none());
         assert!(state.busy.is_none());
@@ -956,6 +1269,20 @@ mod tests {
         assert_eq!(state.selected_total(Section::Clean).0, 0);
         state.toggle(3);
         assert_eq!(state.selected_total(Section::Clean).0, 1);
+    }
+
+    #[test]
+    fn system_view_reads_trash_and_snapshots_in_the_background() {
+        let mut state = State::new(fixture_home());
+        state.select_section(Section::Status);
+        state.update();
+        assert_eq!(
+            state.busy.as_ref().unwrap().label,
+            "Reading Trash and snapshots"
+        );
+        wait_idle(&mut state);
+        let extras = state.extras.expect("extras");
+        assert_eq!(extras.trash, None, "the fixture has no readable Trash");
     }
 
     #[test]

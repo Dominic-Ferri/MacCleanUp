@@ -1,15 +1,32 @@
-use crate::model::{AppItem, CleanItem, DiskItem, OperationResult};
+use crate::model::{AppItem, CleanCategory, CleanItem, DiskItem, OperationResult, RelatedPath};
 use crate::scanner::{
-    identity_matches, is_protected_disk_path, is_safe_app_path, is_safe_cleanup_path,
-    is_safe_installer_path, item_identity, measure,
+    identity_matches, is_protected_disk_path, is_safe_app_data_path, is_safe_app_path,
+    is_safe_build_folder_path, is_safe_cleanup_path, is_safe_installer_path,
+    is_safe_large_file_path,
 };
 use objc2_foundation::{NSFileManager, NSString, NSURL};
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::Path;
 
-pub fn trash_clean_items(items: &[CleanItem], home: &Path) -> OperationResult {
+/// The fixed-root guard each kind of list item must pass before it moves.
+fn passes_guard(item: &CleanItem, home: &Path) -> bool {
+    match item.category {
+        CleanCategory::Cache
+        | CleanCategory::Log
+        | CleanCategory::Temporary
+        | CleanCategory::Developer => is_safe_cleanup_path(&item.path, home),
+        CleanCategory::Installer => is_safe_installer_path(&item.path, home),
+        CleanCategory::LargeFile => is_safe_large_file_path(&item.path, home),
+        CleanCategory::BuildFolder => is_safe_build_folder_path(&item.path, home),
+    }
+}
+
+/// Moves the selected list items to Trash. Each item must still pass its
+/// category's guard and match the identity recorded by the scan.
+pub fn trash_items(items: &[CleanItem], home: &Path) -> OperationResult {
     let mut result = OperationResult::default();
     for item in items.iter().filter(|item| item.selected) {
-        if !is_safe_cleanup_path(&item.path, home) || !identity_matches(&item.path, item.identity) {
+        if !passes_guard(item, home) || !identity_matches(&item.path, item.identity) {
             result.failures.push(format!(
                 "{}: path changed or failed protection",
                 item.path.display()
@@ -45,78 +62,82 @@ pub fn trash_apps(apps: &[AppItem], home: &Path) -> OperationResult {
         if !move_one(&app.path, app.bytes, &mut result) {
             continue;
         }
-        let related = related_app_data(apps, app, home);
+        let related = related_app_data(apps, app);
         if related.kept_shared {
             if let Some(bundle_id) = &app.bundle_id {
                 result.notes.push(format!(
-                    "Kept caches for {bundle_id}: another installed copy uses them."
+                    "Kept caches and app data for {bundle_id}: another installed copy uses them."
                 ));
             }
         }
-        for (path, bytes) in related.paths {
-            let identity = item_identity(&path);
-            if identity.is_some() && identity_matches(&path, identity) {
-                move_one(&path, bytes, &mut result);
+        let bundle_id = app.bundle_id.as_deref().unwrap_or_default();
+        for entry in &related.paths {
+            match related_step(entry, home, bundle_id) {
+                RelatedStep::Gone => {}
+                RelatedStep::Refused => result.failures.push(format!(
+                    "{}: changed since the scan, so it stays",
+                    entry.path.display()
+                )),
+                RelatedStep::Move => {
+                    move_one(&entry.path, entry.bytes, &mut result);
+                }
             }
         }
     }
     result
 }
 
-/// The cache and log folders that uninstalling `app` would also move.
+#[derive(Debug, Eq, PartialEq)]
+enum RelatedStep {
+    /// Already gone, for example cleared from the caches list since the scan.
+    Gone,
+    Refused,
+    Move,
+}
+
+/// Decides whether one scanned cache, log, or data path moves with its app:
+/// it must still pass its guard and match the identity the scan recorded.
+fn related_step(entry: &RelatedPath, home: &Path, bundle_id: &str) -> RelatedStep {
+    if fs::symlink_metadata(&entry.path).is_err() {
+        return RelatedStep::Gone;
+    }
+    let guarded = is_safe_cleanup_path(&entry.path, home)
+        || is_safe_app_data_path(&entry.path, home, bundle_id);
+    if guarded && identity_matches(&entry.path, entry.identity) {
+        RelatedStep::Move
+    } else {
+        RelatedStep::Refused
+    }
+}
+
+/// What uninstalling an app would also move.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RelatedData {
-    pub paths: Vec<(PathBuf, u64)>,
+    pub paths: Vec<RelatedPath>,
     /// True when another installed copy that is not selected uses the same
-    /// bundle ID, so its caches stay.
+    /// bundle ID, so its caches and data stay.
     pub kept_shared: bool,
 }
 
 /// Lists exactly what `trash_apps` moves with `app`, so a preview and the
-/// operation cannot disagree. `apps` supplies the current selection.
-pub fn related_app_data(apps: &[AppItem], app: &AppItem, home: &Path) -> RelatedData {
-    let Some(bundle_id) = &app.bundle_id else {
+/// operation cannot disagree: the scanned caches and logs, plus the app data
+/// when `include_data` is ticked. `apps` supplies the current selection.
+/// Reads nothing from disk, so drawing code may call it every frame.
+pub fn related_app_data(apps: &[AppItem], app: &AppItem) -> RelatedData {
+    if app.bundle_id.is_none() {
         return RelatedData::default();
-    };
-    let mut selection = apps.to_vec();
-    if let Some(entry) = selection.iter_mut().find(|other| other.path == app.path) {
-        entry.selected = true;
     }
-    let mut this = app.clone();
-    this.selected = true;
-    if has_unselected_sibling(&selection, &this) {
+    if has_unselected_sibling(apps, app) {
         return RelatedData {
             paths: Vec::new(),
             kept_shared: true,
         };
     }
+    let data: &[RelatedPath] = if app.include_data { &app.data } else { &[] };
     RelatedData {
-        paths: exact_bundle_caches(home, bundle_id)
-            .into_iter()
-            .filter(|path| is_safe_cleanup_path(path, home))
-            .map(|path| {
-                let bytes = measure(&path).bytes;
-                (path, bytes)
-            })
-            .collect(),
+        paths: app.related.iter().chain(data).cloned().collect(),
         kept_shared: false,
     }
-}
-
-pub fn trash_installers(items: &[CleanItem], home: &Path) -> OperationResult {
-    let mut result = OperationResult::default();
-    for item in items.iter().filter(|item| item.selected) {
-        if !is_safe_installer_path(&item.path, home) || !identity_matches(&item.path, item.identity)
-        {
-            result.failures.push(format!(
-                "{}: path changed or failed protection",
-                item.path.display()
-            ));
-            continue;
-        }
-        move_one(&item.path, item.bytes, &mut result);
-    }
-    result
 }
 
 pub fn trash_disk_item(item: &DiskItem, analyzed_root: &Path, home: &Path) -> OperationResult {
@@ -153,17 +174,11 @@ fn has_unselected_sibling(apps: &[AppItem], app: &AppItem) -> bool {
         .any(|other| !other.selected && other.path != app.path && other.bundle_id == app.bundle_id)
 }
 
-fn exact_bundle_caches(home: &Path, bundle_id: &str) -> [PathBuf; 2] {
-    [
-        home.join("Library/Caches").join(bundle_id),
-        home.join("Library/Logs").join(bundle_id),
-    ]
-}
-
 fn move_one(path: &Path, bytes: u64, result: &mut OperationResult) -> bool {
     match trash_path(path) {
         Ok(()) => {
             result.moved += 1;
+            result.moved_paths.push(path.to_path_buf());
             result.bytes = result.bytes.saturating_add(bytes);
             true
         }
@@ -188,45 +203,123 @@ fn trash_path(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::item_identity;
+    use std::path::PathBuf;
+
+    fn fixture_home() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/home")
+    }
+
+    fn item(path: PathBuf, category: CleanCategory, selected: bool) -> CleanItem {
+        CleanItem {
+            id: path.to_string_lossy().into_owned(),
+            category,
+            name: "item".to_string(),
+            identity: item_identity(&path),
+            path,
+            bytes: 10,
+            selected,
+            complete: true,
+            modified: None,
+        }
+    }
 
     #[test]
     fn unselected_cleanup_items_do_nothing() {
-        let home = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/home");
-        let items = vec![CleanItem {
-            id: "test".to_string(),
-            category: crate::model::CleanCategory::Cache,
-            name: "cache".to_string(),
-            path: home.join("Library/Caches/com.example.alpha"),
-            bytes: 10,
-            selected: false,
-            complete: true,
-            identity: None,
-            modified: None,
-        }];
-        let result = trash_clean_items(&items, &home);
+        let home = fixture_home();
+        let items = vec![item(
+            home.join("Library/Caches/com.example.alpha"),
+            CleanCategory::Cache,
+            false,
+        )];
+        let result = trash_items(&items, &home);
         assert_eq!(result, OperationResult::default());
         assert!(items[0].path.exists());
     }
 
     #[test]
     fn missing_identity_blocks_selected_cleanup_item() {
-        let home = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/home");
-        let path = home.join("Library/Caches/com.example.alpha");
-        let items = vec![CleanItem {
-            id: "test".to_string(),
-            category: crate::model::CleanCategory::Cache,
-            name: "cache".to_string(),
-            path: path.clone(),
-            bytes: 10,
-            selected: true,
-            complete: true,
-            identity: None,
-            modified: None,
-        }];
-        let result = trash_clean_items(&items, &home);
+        let home = fixture_home();
+        let mut cache = item(
+            home.join("Library/Caches/com.example.alpha"),
+            CleanCategory::Cache,
+            true,
+        );
+        cache.identity = None;
+        let result = trash_items(&[cache.clone()], &home);
         assert_eq!(result.moved, 0);
         assert_eq!(result.failures.len(), 1);
-        assert!(path.exists());
+        assert!(cache.path.exists());
+    }
+
+    #[test]
+    fn each_category_uses_its_own_guard() {
+        // Real fixture paths under the wrong category fail the guard. The
+        // guard is called directly, so a regression cannot move a fixture.
+        let home = fixture_home();
+        let cases = [
+            ("Downloads/Setup.dmg", CleanCategory::Cache),
+            ("Library/Caches/com.example.alpha", CleanCategory::Installer),
+            ("Library/Caches/com.example.alpha", CleanCategory::LargeFile),
+            ("Documents/fake/target", CleanCategory::BuildFolder),
+            ("Documents/proj", CleanCategory::BuildFolder),
+            ("Library/Logs/example.log", CleanCategory::LargeFile),
+        ];
+        for (path, category) in cases {
+            let selected = item(home.join(path), category, true);
+            assert!(selected.path.exists(), "{path}");
+            assert!(!passes_guard(&selected, &home), "{path}");
+        }
+        for (path, category) in [
+            ("Library/Caches/com.example.alpha", CleanCategory::Cache),
+            ("Downloads/Setup.dmg", CleanCategory::Installer),
+            ("Downloads/Setup.dmg", CleanCategory::LargeFile),
+            ("Documents/proj/target", CleanCategory::BuildFolder),
+        ] {
+            assert!(
+                passes_guard(&item(home.join(path), category, false), &home),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn related_paths_move_only_with_a_matching_scan_identity() {
+        let home = fixture_home();
+        let id = "com.example.alpha";
+        let entry = |path: &str| {
+            let path = home.join(path);
+            RelatedPath {
+                identity: item_identity(&path),
+                path,
+                bytes: 1,
+            }
+        };
+        let cache = entry("Library/Caches/com.example.alpha");
+        let prefs = entry("Library/Preferences/com.example.alpha.plist");
+        assert_eq!(related_step(&cache, &home, id), RelatedStep::Move);
+        assert_eq!(related_step(&prefs, &home, id), RelatedStep::Move);
+        assert_eq!(
+            related_step(&entry("Library/Caches/com.example.gone"), &home, id),
+            RelatedStep::Gone
+        );
+        // Another folder's identity: the path was replaced after the scan.
+        let mut swapped = cache.clone();
+        swapped.identity = item_identity(&home.join("Library/Caches/com.example.beta"));
+        assert_eq!(related_step(&swapped, &home, id), RelatedStep::Refused);
+        let mut unknown = cache;
+        unknown.identity = None;
+        assert_eq!(related_step(&unknown, &home, id), RelatedStep::Refused);
+        // Outside every guarded root, even with a matching identity.
+        assert_eq!(
+            related_step(&entry("Downloads/Setup.dmg"), &home, id),
+            RelatedStep::Refused
+        );
+        // App data under a different bundle ID than the app's.
+        assert_eq!(
+            related_step(&prefs, &home, "com.example.beta"),
+            RelatedStep::Refused
+        );
     }
 
     #[test]
@@ -234,12 +327,9 @@ mod tests {
         let make_app = |path: &str, selected: bool| AppItem {
             name: "Example".to_string(),
             bundle_id: Some("com.example.shared".to_string()),
-            version: None,
             path: PathBuf::from(path),
-            bytes: 1,
             selected,
-            identity: None,
-            modified: None,
+            ..AppItem::default()
         };
         let selected = make_app("/Applications/Example.app", true);
         let mut apps = vec![
@@ -252,28 +342,37 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_preview_lists_exact_caches_and_respects_shared_copies() {
-        let home = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/home");
-        let app = AppItem {
+    fn uninstall_preview_lists_scanned_caches_data_only_when_ticked_and_respects_shared_copies() {
+        let home = fixture_home();
+        let cache = RelatedPath {
+            path: home.join("Library/Caches/com.example.alpha"),
+            bytes: 10,
+            identity: None,
+        };
+        let data = RelatedPath {
+            path: home.join("Library/Preferences/com.example.alpha.plist"),
+            bytes: 4,
+            identity: None,
+        };
+        let mut app = AppItem {
             name: "Example".to_string(),
             bundle_id: Some("com.example.alpha".to_string()),
-            version: None,
             path: home.join("Applications/Example.app"),
-            bytes: 1,
-            selected: false,
-            identity: None,
-            modified: None,
+            related: vec![cache.clone()],
+            data: vec![data.clone()],
+            ..AppItem::default()
         };
-        let related = related_app_data(std::slice::from_ref(&app), &app, &home);
+        let related = related_app_data(std::slice::from_ref(&app), &app);
         assert!(!related.kept_shared);
-        assert_eq!(
-            related.paths,
-            vec![(home.join("Library/Caches/com.example.alpha"), 10)]
-        );
+        assert_eq!(related.paths, vec![cache.clone()]);
+
+        app.include_data = true;
+        let related = related_app_data(std::slice::from_ref(&app), &app);
+        assert_eq!(related.paths, vec![cache, data]);
 
         let mut copy = app.clone();
         copy.path = home.join("Applications/Copy/Example.app");
-        let related = related_app_data(&[app.clone(), copy], &app, &home);
+        let related = related_app_data(&[app.clone(), copy], &app);
         assert!(related.kept_shared);
         assert!(related.paths.is_empty());
     }

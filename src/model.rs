@@ -29,6 +29,8 @@ pub enum CleanCategory {
     Temporary,
     Developer,
     Installer,
+    LargeFile,
+    BuildFolder,
 }
 
 impl CleanCategory {
@@ -39,6 +41,8 @@ impl CleanCategory {
             Self::Temporary => "Tool downloads",
             Self::Developer => "Developer files",
             Self::Installer => "Installer",
+            Self::LargeFile => "Large file",
+            Self::BuildFolder => "Build folder",
         }
     }
 
@@ -49,22 +53,41 @@ impl CleanCategory {
             Self::Cache => "A cache is a set of copies an app keeps so it can open things faster, such as pictures from websites it has already shown you. It is safe to remove. The app makes a new one when it needs it, so it may be a little slower the first time.",
             Self::Log => "A log is a record an app or macOS keeps of what it did, mostly to help fix problems. Old logs are not needed. Removing one does not change your files, settings, or apps.",
             Self::Temporary => "Leftover downloads from tools you have installed. A tool downloads them again if it needs them.",
-            Self::Developer => "Files that programming tools, such as Xcode, make while building apps. They are safe to remove; the next build takes longer. If you do not write software, you can ignore these.",
+            Self::Developer => "Files that programming tools, such as Xcode, make while building apps or copy from a connected iPhone. They are safe to remove; the next build, or the next time you connect the device, takes longer. If you do not write software, you can ignore these.",
             Self::Installer => "A disk image or package you downloaded to install an app. The installed app keeps working without it.",
+            Self::LargeFile => "A file of 1 GB or more that has not changed in at least 6 months. Check what it is before you remove it: it can be a video, a backup, or a virtual machine disk that you still need.",
+            Self::BuildFolder => "Files a build tool made from a project's source code: a Cargo target folder or an npm node_modules folder. The project's source stays. The next build or npm install makes the folder again, and takes longer.",
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AppItem {
     pub name: String,
     pub bundle_id: Option<String>,
     pub version: Option<String>,
     pub path: PathBuf,
     pub bytes: u64,
+    pub complete: bool,
     pub selected: bool,
     pub identity: Option<ItemIdentity>,
     pub modified: Option<SystemTime>,
+    /// The app's exact bundle-ID cache and log folders, measured during the
+    /// scan. Uninstall moves these with the app.
+    pub related: Vec<RelatedPath>,
+    /// Settings and app data named after the exact bundle ID. Uninstall moves
+    /// these only when `include_data` is ticked.
+    pub data: Vec<RelatedPath>,
+    pub include_data: bool,
+}
+
+/// A folder or file that belongs to an app, with the size and identity the
+/// scan recorded. The operation moves it only if the identity still matches.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RelatedPath {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub identity: Option<ItemIdentity>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,6 +104,7 @@ pub struct DiskItem {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OperationResult {
     pub moved: usize,
+    pub moved_paths: Vec<PathBuf>,
     pub bytes: u64,
     pub failures: Vec<String>,
     pub notes: Vec<String>,

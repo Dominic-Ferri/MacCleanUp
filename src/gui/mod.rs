@@ -7,10 +7,11 @@ use eframe::egui::{
     RichText, Sense, Stroke, StrokeKind, Ui, Vec2,
 };
 use egui_extras::{Column, TableBuilder};
-use maccleanup::model::{format_bytes, AppItem, CleanItem};
+use maccleanup::model::{format_bytes, CleanItem};
 use maccleanup::scanner::is_protected_disk_path;
 use maccleanup::trash::related_app_data;
 use state::{age, plural, tilde_path, Section, SortKey, State};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -23,6 +24,9 @@ pub struct MacCleanUp {
     /// Set when a dialog opens so Cancel receives keyboard focus once.
     focus_cancel: bool,
     initialized: bool,
+    /// The current list's filtered, sorted row order, computed once per
+    /// frame after anything that can change the section.
+    order: Vec<usize>,
 }
 
 impl MacCleanUp {
@@ -31,6 +35,7 @@ impl MacCleanUp {
             state: State::new(home),
             focus_cancel: false,
             initialized: false,
+            order: Vec::new(),
         }
     }
 
@@ -67,6 +72,7 @@ impl MacCleanUp {
                     .inner_margin(Margin::symmetric(18, 6)),
             )
             .show(ui, |ui| self.status_bar(ui));
+        self.order = self.visible_order();
         if has_inspector(self.state.section) {
             egui::Panel::right("inspector")
                 .exact_size(316.0)
@@ -85,11 +91,14 @@ impl MacCleanUp {
                     .inner_margin(Margin::symmetric(28, 22)),
             )
             .show(ui, |ui| match self.state.section {
-                Section::Overview => self.overview(ui),
-                Section::Clean | Section::Installers | Section::Applications => self.list_page(ui),
+                Section::Overview => {
+                    // The review rows outgrow short windows.
+                    egui::ScrollArea::vertical().show(ui, |ui| self.overview(ui));
+                }
                 Section::Disk => self.disk_page(ui),
                 Section::Status => self.status_page(ui),
                 Section::Activity => self.activity_page(ui),
+                _ => self.list_page(ui),
             });
 
         self.dialogs(&ctx);
@@ -109,6 +118,8 @@ impl MacCleanUp {
                 Key::Num5,
                 Key::Num6,
                 Key::Num7,
+                Key::Num8,
+                Key::Num9,
             ]
             .into_iter()
             .enumerate()
@@ -195,8 +206,10 @@ impl MacCleanUp {
         let state = &self.state;
         let total = |items: &[CleanItem]| format_bytes(items.iter().map(|item| item.bytes).sum());
         match section {
-            Section::Clean if state.is_loaded(section) => total(&state.clean_items),
-            Section::Installers if state.is_loaded(section) => total(&state.installer_items),
+            section if section.has_clean_items() && state.is_loaded(section) => state
+                .items(section)
+                .map(|items| total(items))
+                .unwrap_or_default(),
             Section::Applications if state.is_loaded(section) => state.app_items.len().to_string(),
             Section::Activity if !state.activity.is_empty() => state.activity.len().to_string(),
             _ => String::new(),
@@ -322,6 +335,20 @@ impl MacCleanUp {
                 },
                 "Review apps",
             ),
+            search_row(
+                state,
+                Section::LargeFiles,
+                "Files of 1 GB or more you have not changed in 6 months.",
+                "Find large files",
+                "Review large files",
+            ),
+            search_row(
+                state,
+                Section::BuildFolders,
+                "Cargo and npm build output in your projects.",
+                "Find build folders",
+                "Review build folders",
+            ),
             (
                 Section::Disk,
                 "See which folders in your home folder are largest.".to_string(),
@@ -347,7 +374,7 @@ impl MacCleanUp {
         }
         if let Some(section) = go {
             self.state.select_section(section);
-            if section == Section::Installers && !self.state.is_loaded(section) {
+            if section.has_clean_items() && !self.state.is_loaded(section) {
                 self.state.scan(section);
             }
         }
@@ -361,10 +388,6 @@ impl MacCleanUp {
         let filter = state.filter[section.index()].to_lowercase();
         let sort = state.sort[section.index()];
         let mut rows: Vec<(usize, String, u64, Option<SystemTime>, String)> = match section {
-            Section::Clean => clean_rows(&state.clean_items, &state.app_items, &state.home),
-            Section::Installers => {
-                clean_rows(&state.installer_items, &state.app_items, &state.home)
-            }
             Section::Applications => state
                 .app_items
                 .iter()
@@ -379,7 +402,10 @@ impl MacCleanUp {
                     )
                 })
                 .collect(),
-            _ => Vec::new(),
+            section => state
+                .items(section)
+                .map(|items| clean_rows(items, &state.app_names, &state.home))
+                .unwrap_or_default(),
         };
         rows.retain(|(_, name, _, _, extra)| {
             filter.is_empty()
@@ -388,7 +414,7 @@ impl MacCleanUp {
         });
         match sort {
             SortKey::Size => rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1))),
-            SortKey::Name => rows.sort_by_key(|row| row.1.to_lowercase()),
+            SortKey::Name => rows.sort_by_cached_key(|row| row.1.to_lowercase()),
             SortKey::Modified => rows.sort_by_key(|row| std::cmp::Reverse(row.3)),
         }
         rows.into_iter().map(|row| row.0).collect()
@@ -449,12 +475,14 @@ impl MacCleanUp {
                 "Not scanned yet",
                 match section {
                     Section::Installers => "Scan looks in Downloads, Desktop, Documents, Public, and iCloud Downloads. macOS may ask MacCleanUp for access to those folders the first time.",
+                    Section::LargeFiles | Section::BuildFolders => "Scan looks through your whole home folder except Library and the Trash, so it takes a while. macOS may ask MacCleanUp for access to Desktop, Documents, and Downloads the first time.",
+                    _ if self.state.is_stopped(section) => "The scan was stopped. Scan to see what is here.",
                     _ => "Scan to see what is here.",
                 },
             );
             return;
         }
-        let order = self.visible_order();
+        let order = self.order.clone();
         if order.is_empty() {
             let empty = if self.state.filter[section.index()].is_empty() {
                 match section {
@@ -464,6 +492,10 @@ impl MacCleanUp {
                     Section::Applications => {
                         "No apps were found in /Applications or ~/Applications."
                     }
+                    Section::LargeFiles => {
+                        "No file of 1 GB or more has gone unchanged for 6 months."
+                    }
+                    Section::BuildFolders => "No Cargo or npm build folders were found.",
                     _ => "Nothing to clear here right now.",
                 }
             } else {
@@ -481,8 +513,8 @@ impl MacCleanUp {
         let all_selected = order.iter().all(|&index| self.is_selected(index));
         let third = match section {
             Section::Applications => "Version",
-            Section::Installers => "Folder",
-            _ => "Type",
+            Section::Clean => "Type",
+            _ => "Folder",
         };
         let row_height = 30.0;
         TableBuilder::new(ui)
@@ -590,65 +622,36 @@ impl MacCleanUp {
     }
 
     fn is_selected(&self, index: usize) -> bool {
-        match self.state.section {
-            Section::Clean => self
-                .state
-                .clean_items
-                .get(index)
-                .is_some_and(|item| item.selected),
-            Section::Installers => self
-                .state
-                .installer_items
-                .get(index)
-                .is_some_and(|item| item.selected),
-            Section::Applications => self
-                .state
-                .app_items
-                .get(index)
-                .is_some_and(|app| app.selected),
-            _ => false,
-        }
+        self.state.is_selected(index)
     }
 
     fn row_text(&self, index: usize) -> (String, String, u64, Option<SystemTime>, bool) {
         let state = &self.state;
-        match state.section {
-            Section::Applications => {
-                let app = &state.app_items[index];
-                (
-                    app.name.clone(),
-                    app.version.clone().unwrap_or_else(|| "Unknown".to_string()),
-                    app.bytes,
-                    app.modified,
-                    true,
-                )
-            }
-            Section::Installers => {
-                let item = &state.installer_items[index];
-                let folder = item
-                    .path
-                    .parent()
-                    .map(|parent| tilde_path(parent, &state.home))
-                    .unwrap_or_default();
-                (
-                    item.name.clone(),
-                    folder,
-                    item.bytes,
-                    item.modified,
-                    item.complete,
-                )
-            }
-            _ => {
-                let item = &state.clean_items[index];
-                (
-                    friendly_name(&item.name, &state.app_items),
-                    item.category.label().to_string(),
-                    item.bytes,
-                    item.modified,
-                    item.complete,
-                )
-            }
+        if state.section == Section::Applications {
+            let app = &state.app_items[index];
+            return (
+                app.name.clone(),
+                app.version.clone().unwrap_or_else(|| "Unknown".to_string()),
+                app.bytes,
+                app.modified,
+                app.complete,
+            );
         }
+        let item = &state.items(state.section).expect("list section")[index];
+        let (name, third) = if state.section == Section::Clean {
+            (
+                friendly_name(&item.name, &state.app_names),
+                item.category.label().to_string(),
+            )
+        } else {
+            let folder = item
+                .path
+                .parent()
+                .map(|parent| tilde_path(parent, &state.home))
+                .unwrap_or_default();
+            (item.name.clone(), folder)
+        };
+        (name, third, item.bytes, item.modified, item.complete)
     }
 
     // Disk map --------------------------------------------------------------
@@ -970,6 +973,38 @@ impl MacCleanUp {
                 "Since the last restart.",
             );
         });
+        ui.add_space(8.0);
+        let extras = self.state.extras;
+        let pending = if self.state.is_stopped(Section::Status) {
+            "Stopped. Press Cmd-R to read it."
+        } else {
+            "Reading…"
+        };
+        ui.columns(2, |columns| {
+            let (trash, detail) = match extras.map(|extras| extras.trash) {
+                None => (pending.to_string(), String::new()),
+                Some(None) => (
+                    "Unavailable".to_string(),
+                    "macOS does not let MacCleanUp read the Trash. Open the Trash in Finder to see it.".to_string(),
+                ),
+                Some(Some(size)) => (
+                    size_text(size.bytes, size.complete),
+                    "Space comes back only when you empty the Trash. MacCleanUp never empties it.".to_string(),
+                ),
+            };
+            figure(&mut columns[0], "In the Trash", &trash, &detail);
+            let snapshots = match extras.map(|extras| extras.snapshots) {
+                None => pending.to_string(),
+                Some(None) => "Unavailable".to_string(),
+                Some(Some(count)) => count.to_string(),
+            };
+            figure(
+                &mut columns[1],
+                "Time Machine local snapshots",
+                &snapshots,
+                "Copies of the startup disk that macOS keeps between backups. macOS removes them by itself when it needs the space.",
+            );
+        });
     }
 
     // Activity --------------------------------------------------------------
@@ -1015,7 +1050,7 @@ impl MacCleanUp {
             || self
                 .state
                 .focus_index()
-                .is_some_and(|focus| self.visible_order().contains(&focus));
+                .is_some_and(|focus| self.order.contains(&focus));
         let state = &self.state;
         let Some(index) = state.focus_index().filter(|_| visible) else {
             ui.label(RichText::new("Details").font(condensed(20.0)));
@@ -1028,14 +1063,15 @@ impl MacCleanUp {
         };
         let home = state.home.clone();
         let mut reveal: Option<PathBuf> = None;
+        let mut toggle_data = false;
         egui::ScrollArea::vertical().show(ui, |ui| match state.section {
-            Section::Clean | Section::Installers => {
-                let item = if state.section == Section::Clean {
-                    &state.clean_items[index]
+            section if section.has_clean_items() => {
+                let item = &state.items(section).expect("list section")[index];
+                let shown = if section == Section::Clean {
+                    friendly_name(&item.name, &state.app_names)
                 } else {
-                    &state.installer_items[index]
+                    item.name.clone()
                 };
-                let shown = friendly_name(&item.name, &state.app_items);
                 inspector_title(ui, &shown, item.category.label());
                 ui.label(RichText::new("What it is").font(medium(13.0)).color(SILT));
                 ui.label(item.category.explanation());
@@ -1062,7 +1098,7 @@ impl MacCleanUp {
                         .map(|version| format!("Version {version}"))
                         .unwrap_or_else(|| "Version unknown".to_string()),
                 );
-                fact(ui, "Size", &format_bytes(app.bytes));
+                fact(ui, "Size", &size_text(app.bytes, app.complete));
                 fact(ui, "Changed", &age(app.modified));
                 fact(
                     ui,
@@ -1073,21 +1109,52 @@ impl MacCleanUp {
                 ui.add_space(12.0);
                 ui.label(RichText::new("Uninstall moves").font(medium(13.0)).color(SILT));
                 ui.label(format!("{}  {}", app.name, format_bytes(app.bytes)));
-                let related = related_app_data(&state.app_items, app, &home);
-                for (path, bytes) in &related.paths {
-                    ui.label(format!("{}  {}", tilde_path(path, &home), format_bytes(*bytes)));
+                let related = related_app_data(&state.app_items, app);
+                for entry in &related.paths {
+                    ui.label(format!(
+                        "{}  {}",
+                        tilde_path(&entry.path, &home),
+                        format_bytes(entry.bytes)
+                    ));
                 }
                 if related.kept_shared {
                     ui.label(
-                        RichText::new("Its caches stay, because another installed copy uses them.")
+                        RichText::new("Its caches and app data stay, because another installed copy uses them.")
                             .color(SILT),
                     );
                 } else if related.paths.is_empty() {
                     ui.label(RichText::new("No caches or logs were found for this app.").color(SILT));
                 }
+                if !app.data.is_empty() && !related.kept_shared {
+                    ui.add_space(10.0);
+                    let total: u64 = app.data.iter().map(|data| data.bytes).sum();
+                    let mut include = app.include_data;
+                    if ui
+                        .checkbox(
+                            &mut include,
+                            format!("Also move settings and app data ({})", format_bytes(total)),
+                        )
+                        .clicked()
+                    {
+                        toggle_data = true;
+                    }
+                    if !app.include_data {
+                        for data in &app.data {
+                            ui.label(
+                                RichText::new(tilde_path(&data.path, &home))
+                                    .small()
+                                    .color(SILT),
+                            );
+                        }
+                    }
+                }
                 ui.add_space(10.0);
                 ui.label(RichText::new("Stays on your Mac").font(medium(13.0)).color(SILT));
-                ui.label("Settings, documents, app containers, and browser profiles.");
+                ui.label(if app.include_data {
+                    "Documents, app containers, and folders not named after this app's bundle ID."
+                } else {
+                    "Settings, documents, app containers, and other personal data."
+                });
                 ui.add_space(10.0);
                 if ui.button("Show in Finder").clicked() {
                     reveal = Some(app.path.clone());
@@ -1120,6 +1187,9 @@ impl MacCleanUp {
             _ => {}
         });
         // Buttons that change state are handled after the immutable borrow.
+        if toggle_data {
+            self.state.toggle_app_data(index);
+        }
         if self.state.section == Section::Disk {
             if let Some(index) = self.state.focus_index() {
                 let item = self.state.disk_items[index].clone();
@@ -1336,22 +1406,38 @@ impl eframe::App for MacCleanUp {
 // Small drawing helpers ------------------------------------------------------
 
 fn has_inspector(section: Section) -> bool {
-    matches!(
-        section,
-        Section::Clean | Section::Applications | Section::Installers | Section::Disk
-    )
+    is_list(section) || section == Section::Disk
 }
 
 fn is_list(section: Section) -> bool {
-    matches!(
-        section,
-        Section::Clean | Section::Applications | Section::Installers
-    )
+    section == Section::Applications || section.has_clean_items()
+}
+
+/// An Overview row for a search that waits for a click.
+fn search_row(
+    state: &State,
+    section: Section,
+    detail: &str,
+    find: &'static str,
+    review: &'static str,
+) -> (Section, String, &'static str) {
+    match state.items(section).filter(|_| state.is_loaded(section)) {
+        Some(items) => (
+            section,
+            format!(
+                "{} found, {}",
+                plural(items.len(), "item", "items"),
+                format_bytes(items.iter().map(|item| item.bytes).sum())
+            ),
+            review,
+        ),
+        None => (section, format!("{detail} Not scanned yet."), find),
+    }
 }
 
 fn clean_rows(
     items: &[CleanItem],
-    apps: &[AppItem],
+    app_names: &HashMap<String, String>,
     home: &Path,
 ) -> Vec<(usize, String, u64, Option<SystemTime>, String)> {
     items
@@ -1360,7 +1446,7 @@ fn clean_rows(
         .map(|(index, item)| {
             (
                 index,
-                friendly_name(&item.name, apps),
+                friendly_name(&item.name, app_names),
                 item.bytes,
                 item.modified,
                 tilde_path(&item.path, home),
@@ -1372,14 +1458,10 @@ fn clean_rows(
 /// Turns a folder named after a bundle ID into a name people recognise:
 /// the installed app's name when one matches, otherwise a tidied form of
 /// the ID ("com.google.Chrome" becomes "Google Chrome"). Other names pass
-/// through unchanged.
-fn friendly_name(folder: &str, apps: &[AppItem]) -> String {
-    if let Some(app) = apps.iter().find(|app| {
-        app.bundle_id
-            .as_deref()
-            .is_some_and(|id| id.eq_ignore_ascii_case(folder))
-    }) {
-        return app.name.clone();
+/// through unchanged. `app_names` is keyed by lowercased bundle ID.
+fn friendly_name(folder: &str, app_names: &HashMap<String, String>) -> String {
+    if let Some(name) = app_names.get(&folder.to_lowercase()) {
+        return name.clone();
     }
     let parts: Vec<&str> = folder.split('.').collect();
     let reverse_dns = parts.len() >= 3
@@ -1668,10 +1750,14 @@ fn clock(when: SystemTime) -> String {
 
 /// Selects the item in Finder. Runs only on an explicit button press.
 fn reveal_in_finder(path: &Path) {
-    let _ = std::process::Command::new("/usr/bin/open")
+    if let Ok(mut child) = std::process::Command::new("/usr/bin/open")
         .arg("-R")
         .arg(path)
-        .spawn();
+        .spawn()
+    {
+        // Collect the exit status so no finished process lingers.
+        std::thread::spawn(move || child.wait());
+    }
 }
 
 #[cfg(test)]
@@ -1844,15 +1930,24 @@ mod tests {
         harness.run_steps(2);
         {
             let app = &mut harness.state_mut().state;
+            let related = |path: &str, bytes| maccleanup::model::RelatedPath {
+                path: home.join(path),
+                bytes,
+                identity: None,
+            };
             app.app_items = vec![maccleanup::model::AppItem {
                 name: "Example".to_string(),
                 bundle_id: Some("com.example.alpha".to_string()),
                 version: Some("2.4".to_string()),
                 path: home.join("Applications/Example.app"),
                 bytes: 2_000_000,
-                selected: false,
-                identity: None,
-                modified: None,
+                complete: true,
+                related: vec![related("Library/Caches/com.example.alpha", 4_096)],
+                data: vec![related(
+                    "Library/Preferences/com.example.alpha.plist",
+                    4_096,
+                )],
+                ..Default::default()
             }];
             app.set_focus(0);
         }
@@ -1860,7 +1955,35 @@ mod tests {
         harness.get_by_label("Version 2.4");
         harness.get_by_label("Uninstall moves");
         harness.get_by_label_contains("Library/Caches/com.example.alpha");
+        harness.get_by_label_contains("Preferences/com.example.alpha.plist");
         shot(&mut harness, "applications");
+
+        // App data starts unticked; the checkbox ticks it.
+        assert!(!harness.state().state.app_items[0].include_data);
+        harness
+            .get_by_label_contains("Also move settings and app data")
+            .click();
+        harness.run_steps(2);
+        assert!(harness.state().state.app_items[0].include_data);
+    }
+
+    #[test]
+    fn search_sections_wait_for_a_scan_then_list_results() {
+        let mut harness = harness(fixture_home());
+        settle(&mut harness);
+        nav(&mut harness, "Build folders");
+        harness.run_steps(2);
+        harness.get_by_label("Not scanned yet");
+        harness.get_by_label("Scan").click();
+        settle(&mut harness);
+        // The focused row's name also titles the details panel.
+        assert!(harness.query_all_by_label("target").count() >= 1);
+        assert!(harness.query_all_by_label("node_modules").count() >= 1);
+        harness.get_by_label("~/Documents/proj");
+        shot(&mut harness, "build-folders");
+        nav(&mut harness, "Large old files");
+        harness.run_steps(2);
+        harness.get_by_label("Not scanned yet");
     }
 
     #[test]
@@ -1926,16 +2049,12 @@ mod tests {
 
     #[test]
     fn cache_folders_show_names_people_recognise() {
-        let apps = vec![maccleanup::model::AppItem {
+        let apps = state::app_names(&[maccleanup::model::AppItem {
             name: "Brave Browser".to_string(),
             bundle_id: Some("com.brave.Browser".to_string()),
-            version: None,
             path: PathBuf::from("/Applications/Brave Browser.app"),
-            bytes: 1,
-            selected: false,
-            identity: None,
-            modified: None,
-        }];
+            ..Default::default()
+        }]);
         assert_eq!(friendly_name("com.brave.Browser", &apps), "Brave Browser");
         assert_eq!(friendly_name("COM.BRAVE.BROWSER", &apps), "Brave Browser");
         assert_eq!(friendly_name("com.google.Chrome", &apps), "Google Chrome");

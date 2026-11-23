@@ -1,7 +1,60 @@
+use crate::scanner::{measure_all, Size};
 use objc2_foundation::NSProcessInfo;
 use std::ffi::CString;
 use std::mem::{size_of, MaybeUninit};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Read-only storage figures that take longer than the 2-second metrics.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StorageExtras {
+    /// None when macOS does not let MacCleanUp read the Trash.
+    pub trash: Option<Size>,
+    /// Time Machine local snapshots on the startup disk. None when `tmutil`
+    /// cannot list them.
+    pub snapshots: Option<usize>,
+}
+
+pub fn storage_extras(home: &Path, cancel: &AtomicBool) -> StorageExtras {
+    StorageExtras {
+        trash: trash_size(&home.join(".Trash"), cancel),
+        snapshots: local_snapshots(),
+    }
+}
+
+fn trash_size(trash: &Path, cancel: &AtomicBool) -> Option<Size> {
+    let children: Vec<PathBuf> = std::fs::read_dir(trash)
+        .ok()?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let sizes = measure_all(&children, cancel).sizes;
+    Some(Size {
+        bytes: sizes.iter().map(|size| size.bytes).sum(),
+        complete: sizes.iter().all(|size| size.complete),
+    })
+}
+
+/// Counts snapshots with `tmutil listlocalsnapshots /`, which needs no
+/// administrator rights and changes nothing.
+fn local_snapshots() -> Option<usize> {
+    let output = std::process::Command::new("/usr/bin/tmutil")
+        .args(["listlocalsnapshots", "/"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(count_snapshots(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn count_snapshots(listing: &str) -> usize {
+    listing
+        .lines()
+        .filter(|line| line.trim_start().starts_with("com.apple.TimeMachine."))
+        .count()
+}
 
 #[derive(Clone, Debug)]
 pub struct SystemStatus {
@@ -174,5 +227,21 @@ mod tests {
         assert!(disk.available <= disk.total);
         assert!(status.uptime_seconds.is_some());
         assert!(status.load_average.is_some());
+    }
+
+    #[test]
+    fn snapshot_listing_counts_only_snapshot_lines() {
+        let listing = "Snapshots for disk /:\ncom.apple.TimeMachine.2026-11-23-092637.local (dataless)\ncom.apple.TimeMachine.2026-11-23-102637.local\n";
+        assert_eq!(count_snapshots(listing), 2);
+        assert_eq!(count_snapshots("Snapshots for disk /:\n"), 0);
+    }
+
+    #[test]
+    fn unreadable_or_missing_trash_is_unavailable_not_empty() {
+        let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/home/.Trash");
+        assert_eq!(trash_size(&missing, &AtomicBool::new(false)), None);
+        let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/home/Library/Logs");
+        let size = trash_size(&folder, &AtomicBool::new(false)).unwrap();
+        assert!(size.complete && size.bytes > 0);
     }
 }
