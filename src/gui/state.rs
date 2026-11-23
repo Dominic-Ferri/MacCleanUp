@@ -22,6 +22,7 @@ pub const STATUS_REFRESH: Duration = Duration::from_secs(2);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Section {
     Overview,
+    Storage,
     Clean,
     Applications,
     Installers,
@@ -33,9 +34,10 @@ pub enum Section {
 }
 
 impl Section {
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 10;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Overview,
+        Self::Storage,
         Self::Clean,
         Self::Applications,
         Self::Installers,
@@ -49,6 +51,7 @@ impl Section {
     pub fn title(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
+            Self::Storage => "Storage",
             Self::Clean => "Caches and logs",
             Self::Applications => "Applications",
             Self::Installers => "Installer files",
@@ -63,6 +66,7 @@ impl Section {
     pub fn description(self) -> &'static str {
         match self {
             Self::Overview => "Where your storage goes, and what you can safely clear.",
+            Self::Storage => "Everything on your startup disk, part by part. Click a part to see what it holds.",
             Self::Clean => "Tick the items you want to clear, then move them to Trash.",
             Self::Applications => "Uninstall moves the app and its exact caches and logs. Settings and app data move only if you tick them.",
             Self::Installers => "Disk images and packages left in Downloads, Desktop, Documents, Public, and iCloud Downloads.",
@@ -86,7 +90,10 @@ impl Section {
     /// folders; those can raise macOS privacy prompts, so they wait for an
     /// explicit scan.
     fn loads_automatically(self) -> bool {
-        matches!(self, Self::Clean | Self::Applications | Self::Status)
+        matches!(
+            self,
+            Self::Storage | Self::Clean | Self::Applications | Self::Status
+        )
     }
 
     /// Sections whose rows are `CleanItem`s with a selection.
@@ -160,7 +167,7 @@ enum WorkerMessage {
     ),
     Breakdown(u64, Option<VolumeUsage>, Breakdown),
     Disk(u64, PathBuf, DiskScan),
-    Storage(u64, StorageExtras),
+    Storage(u64, StorageExtras, Option<VolumeUsage>),
     Operation(u64, Section, Vec<(String, u64)>, OperationResult),
 }
 
@@ -325,7 +332,10 @@ impl State {
                 checked: now.checked,
             };
         }
-        let wants_status = matches!(self.section, Section::Status | Section::Overview);
+        let wants_status = matches!(
+            self.section,
+            Section::Status | Section::Overview | Section::Storage
+        );
         if wants_status
             && self
                 .status_read_at
@@ -416,13 +426,17 @@ impl State {
                 },
             ),
             Section::Disk => self.open_folder(self.disk_root.clone()),
-            Section::Status => {
+            Section::Status | Section::Storage => {
                 self.read_status();
                 self.spawn(
                     "Reading Trash and snapshots",
                     vec![section],
                     move |generation, cancel| {
-                        WorkerMessage::Storage(generation, system::storage_extras(&home, cancel))
+                        WorkerMessage::Storage(
+                            generation,
+                            system::storage_extras(&home, cancel),
+                            system::volume_usage(),
+                        )
                     },
                 );
             }
@@ -582,7 +596,7 @@ impl State {
                 | WorkerMessage::Overview(generation, ..)
                 | WorkerMessage::Breakdown(generation, ..)
                 | WorkerMessage::Disk(generation, ..)
-                | WorkerMessage::Storage(generation, _)
+                | WorkerMessage::Storage(generation, ..)
                 | WorkerMessage::Operation(generation, ..) => *generation,
             };
             if generation != self.generation {
@@ -605,18 +619,19 @@ impl State {
                     self.clean_items = clean.items;
                     let clean = self.finish_scan(Section::Clean, count, clean.errors);
                     let apps = self.finish_apps(apps);
-                    self.volumes = volumes.or(self.volumes);
+                    self.keep_volumes(volumes);
                     format!("Caches: {clean} Apps: {apps}")
                 }
                 WorkerMessage::Breakdown(_, volumes, breakdown) => {
-                    self.volumes = volumes.or(self.volumes);
+                    self.keep_volumes(volumes);
                     self.breakdown = Some(breakdown);
                     "Storage measured.".to_string()
                 }
                 WorkerMessage::Disk(_, root, result) => self.finish_disk(&root, result),
-                WorkerMessage::Storage(_, extras) => {
+                WorkerMessage::Storage(_, extras, volumes) => {
                     self.extras = Some(extras);
-                    "System metrics refreshed.".to_string()
+                    self.keep_volumes(volumes);
+                    "Storage and system metrics refreshed.".to_string()
                 }
                 WorkerMessage::Operation(_, section, moves, result) => {
                     self.finish_operation(section, moves, result);
@@ -629,6 +644,13 @@ impl State {
                 Some(summary) => format!("{summary} List refreshed."),
                 None => message,
             };
+        }
+    }
+
+    /// A failed read keeps the last good volume figures.
+    fn keep_volumes(&mut self, volumes: Option<VolumeUsage>) {
+        if volumes.is_some() {
+            self.volumes = volumes;
         }
     }
 

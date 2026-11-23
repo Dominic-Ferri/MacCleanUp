@@ -13,13 +13,13 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Read-only storage figures that take longer than the 2-second metrics.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StorageExtras {
     /// None when macOS does not let MacCleanUp read the Trash.
     pub trash: Option<Size>,
-    /// Time Machine local snapshots on the startup disk. None when `tmutil`
-    /// cannot list them.
-    pub snapshots: Option<usize>,
+    /// Names of the Time Machine local snapshots on the startup disk. None
+    /// when `tmutil` cannot list them.
+    pub snapshots: Option<Vec<String>>,
 }
 
 pub fn storage_extras(home: &Path, control: &Control) -> StorageExtras {
@@ -42,9 +42,9 @@ fn trash_size(trash: &Path, control: &Control) -> Option<Size> {
     })
 }
 
-/// Counts snapshots with `tmutil listlocalsnapshots /`, which needs no
+/// Lists snapshots with `tmutil listlocalsnapshots /`, which needs no
 /// administrator rights and changes nothing.
-fn local_snapshots() -> Option<usize> {
+fn local_snapshots() -> Option<Vec<String>> {
     let output = std::process::Command::new("/usr/bin/tmutil")
         .args(["listlocalsnapshots", "/"])
         .output()
@@ -52,21 +52,25 @@ fn local_snapshots() -> Option<usize> {
     if !output.status.success() {
         return None;
     }
-    Some(count_snapshots(&String::from_utf8_lossy(&output.stdout)))
+    Some(snapshot_names(&String::from_utf8_lossy(&output.stdout)))
 }
 
-fn count_snapshots(listing: &str) -> usize {
+fn snapshot_names(listing: &str) -> Vec<String> {
     listing
         .lines()
-        .filter(|line| line.trim_start().starts_with("com.apple.TimeMachine."))
-        .count()
+        .map(str::trim)
+        .filter(|line| line.starts_with("com.apple.TimeMachine."))
+        .map(str::to_string)
+        .collect()
 }
 
 /// How the startup disk's APFS container is used, by volume role.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VolumeUsage {
     /// The System, Preboot, Recovery, Update and other macOS volumes.
     pub macos: u64,
+    /// Each macOS volume's name and size, largest first.
+    pub macos_volumes: Vec<(String, u64)>,
     /// The Data volume: apps, your files, and everything else you add.
     pub data: u64,
     /// The VM volume: swap files and the sleep image.
@@ -181,16 +185,23 @@ fn container_usage(plist: &[u8], container: &str) -> Option<VolumeUsage> {
                             .collect()
                     })
                     .unwrap_or_default();
-                let slot = if roles.iter().any(|role| role == "Data") {
-                    &mut usage.data
+                if roles.iter().any(|role| role == "Data") {
+                    usage.data = usage.data.saturating_add(used);
                 } else if roles.iter().any(|role| role == "VM") {
-                    &mut usage.vm
+                    usage.vm = usage.vm.saturating_add(used);
                 } else {
-                    &mut usage.macos
-                };
-                *slot = slot.saturating_add(used);
+                    usage.macos = usage.macos.saturating_add(used);
+                    let name = get(volume, "Name")
+                        .as_deref()
+                        .and_then(instance_of::<NSString>)
+                        .map_or_else(|| roles.join(", "), |name| name.to_string());
+                    usage.macos_volumes.push((name, used));
+                }
             }
         }
+        usage
+            .macos_volumes
+            .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         found.then_some(usage)
     })
 }
@@ -235,18 +246,36 @@ pub struct Breakdown {
     pub backups: Option<Size>,
     pub mail: Option<Size>,
     pub trash: Option<Size>,
+    /// Every folder or file measured, with its part, so the Storage view can
+    /// show what each part holds. Backups list one folder per device.
+    pub entries: Vec<StorageEntry>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Part {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoragePart {
     Files,
     Developer,
     Backups,
     Mail,
+    Trash,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageEntry {
+    pub part: StoragePart,
+    pub path: PathBuf,
+    pub size: Size,
+}
+
+/// The children of `folder`, or None when it cannot be read.
+fn children(folder: &Path) -> Option<Vec<PathBuf>> {
+    let listing = std::fs::read_dir(folder).ok()?;
+    Some(listing.flatten().map(|entry| entry.path()).collect())
 }
 
 /// Measures the breakdown in one parallel walk.
 pub fn storage_breakdown(home: &Path, control: &Control) -> Breakdown {
+    use StoragePart as Part;
     let exists = |path: &PathBuf| std::fs::symlink_metadata(path).is_ok();
     let readable = |path: &PathBuf| std::fs::read_dir(path).is_ok();
     let mut parts: Vec<(Part, PathBuf)> = Vec::new();
@@ -286,36 +315,49 @@ pub fn storage_breakdown(home: &Path, control: &Control) -> Breakdown {
             .iter()
             .map(|root| (Part::Developer, root.clone())),
     );
-    let backups = home.join("Library/Application Support/MobileSync/Backup");
-    let has_backups = readable(&backups);
-    if has_backups {
-        parts.push((Part::Backups, backups));
-    }
+    let backups = children(&home.join("Library/Application Support/MobileSync/Backup"));
+    let has_backups = backups.is_some();
+    parts.extend(
+        backups
+            .into_iter()
+            .flatten()
+            .map(|path| (Part::Backups, path)),
+    );
     let mail: Vec<PathBuf> = [home.join("Library/Mail"), home.join("Library/Messages")]
         .into_iter()
         .filter(readable)
         .collect();
     let has_mail = !mail.is_empty();
     parts.extend(mail.into_iter().map(|path| (Part::Mail, path)));
+    let trash = children(&home.join(".Trash"));
+    let has_trash = trash.is_some();
+    parts.extend(trash.into_iter().flatten().map(|path| (Part::Trash, path)));
     parts.retain(|(_, path)| exists(path));
 
     let paths: Vec<PathBuf> = parts.iter().map(|(_, path)| path.clone()).collect();
     let sizes = measure_all(&paths, control).sizes;
+    let mut entries: Vec<StorageEntry> = parts
+        .into_iter()
+        .zip(sizes)
+        .map(|((part, path), size)| StorageEntry { part, path, size })
+        .collect();
+    entries.sort_by(|a, b| {
+        b.size
+            .bytes
+            .cmp(&a.size.bytes)
+            .then_with(|| a.path.cmp(&b.path))
+    });
     let total = |wanted: Part| {
-        parts
-            .iter()
-            .zip(&sizes)
-            .filter(|((part, _), _)| *part == wanted)
-            .fold(
-                Size {
-                    bytes: 0,
-                    complete: true,
-                },
-                |sum, (_, size)| Size {
-                    bytes: sum.bytes.saturating_add(size.bytes),
-                    complete: sum.complete && size.complete,
-                },
-            )
+        entries.iter().filter(|entry| entry.part == wanted).fold(
+            Size {
+                bytes: 0,
+                complete: true,
+            },
+            |sum, entry| Size {
+                bytes: sum.bytes.saturating_add(entry.size.bytes),
+                complete: sum.complete && entry.size.complete,
+            },
+        )
     };
     Breakdown {
         files: total(Part::Files),
@@ -323,7 +365,8 @@ pub fn storage_breakdown(home: &Path, control: &Control) -> Breakdown {
         developer_roots,
         backups: has_backups.then(|| total(Part::Backups)),
         mail: has_mail.then(|| total(Part::Mail)),
-        trash: trash_size(&home.join(".Trash"), control),
+        trash: has_trash.then(|| total(Part::Trash)),
+        entries,
     }
 }
 
@@ -336,6 +379,22 @@ pub struct SystemStatus {
     pub disk: Option<DiskStatus>,
     pub uptime_seconds: Option<u64>,
     pub load_average: Option<[f64; 3]>,
+    pub swap: Option<SwapStatus>,
+}
+
+/// Swap files on the VM volume, from `vm.swapusage`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SwapStatus {
+    pub total: u64,
+    pub used: u64,
+}
+
+fn swap_status() -> Option<SwapStatus> {
+    let usage = sysctl_value::<libc::xsw_usage>("vm.swapusage").ok()?;
+    Some(SwapStatus {
+        total: usage.xsu_total,
+        used: usage.xsu_used,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -367,6 +426,7 @@ pub fn collect() -> SystemStatus {
         disk: disk_status(),
         uptime_seconds: uptime(),
         load_average: load_average(),
+        swap: swap_status(),
     }
 }
 
@@ -498,6 +558,8 @@ mod tests {
         assert!(disk.available <= disk.total);
         assert!(status.uptime_seconds.is_some());
         assert!(status.load_average.is_some());
+        let swap = status.swap.expect("swap metrics");
+        assert!(swap.used <= swap.total);
     }
 
     #[test]
@@ -524,6 +586,11 @@ mod tests {
 </array></dict></plist>"#;
         let usage = container_usage(plist, "disk3").unwrap();
         assert_eq!((usage.macos, usage.data, usage.vm), (120, 5000, 300));
+        // Unnamed volumes fall back to their role.
+        assert_eq!(
+            usage.macos_volumes,
+            [("System".to_string(), 100), ("Preboot".to_string(), 20)]
+        );
         assert_eq!(container_usage(plist, "disk9"), None);
         assert_eq!(container_usage(b"not a plist", "disk3"), None);
     }
@@ -551,6 +618,17 @@ mod tests {
         assert!(breakdown.files.complete);
         assert!(breakdown.developer_roots.contains(&home.join(".npm")));
         assert!(breakdown.developer.bytes >= du(".npm"));
+        let desktop = breakdown
+            .entries
+            .iter()
+            .find(|entry| entry.path == home.join("Desktop"))
+            .expect("one entry per measured folder");
+        assert_eq!(desktop.part, StoragePart::Files);
+        assert_eq!(desktop.size.bytes, du("Desktop"));
+        assert!(breakdown
+            .entries
+            .windows(2)
+            .all(|pair| pair[0].size.bytes >= pair[1].size.bytes));
         assert_eq!(breakdown.backups, None, "no backup folder in the fixture");
         assert_eq!(breakdown.mail, None);
         assert_eq!(breakdown.trash, None);
@@ -559,8 +637,14 @@ mod tests {
     #[test]
     fn snapshot_listing_counts_only_snapshot_lines() {
         let listing = "Snapshots for disk /:\ncom.apple.TimeMachine.2026-11-23-092637.local (dataless)\ncom.apple.TimeMachine.2026-11-23-102637.local\n";
-        assert_eq!(count_snapshots(listing), 2);
-        assert_eq!(count_snapshots("Snapshots for disk /:\n"), 0);
+        assert_eq!(
+            snapshot_names(listing),
+            [
+                "com.apple.TimeMachine.2026-11-23-092637.local (dataless)",
+                "com.apple.TimeMachine.2026-11-23-102637.local"
+            ]
+        );
+        assert!(snapshot_names("Snapshots for disk /:\n").is_empty());
     }
 
     #[test]

@@ -9,6 +9,7 @@ use eframe::egui::{
 use egui_extras::{Column, TableBuilder};
 use maccleanup::model::{format_bytes, CleanItem};
 use maccleanup::scanner::is_protected_disk_path;
+use maccleanup::system::StoragePart;
 use maccleanup::trash::related_app_data;
 use state::{age, plural, tilde_path, Section, SortKey, State};
 use std::collections::HashMap;
@@ -27,6 +28,8 @@ pub struct MacCleanUp {
     /// The current list's filtered, sorted row order, computed once per
     /// frame after anything that can change the section.
     order: Vec<usize>,
+    /// The part of the startup disk shown in the Storage view's details.
+    storage_focus: Option<Part>,
 }
 
 impl MacCleanUp {
@@ -36,6 +39,7 @@ impl MacCleanUp {
             focus_cancel: false,
             initialized: false,
             order: Vec::new(),
+            storage_focus: None,
         }
     }
 
@@ -95,6 +99,7 @@ impl MacCleanUp {
                     // The review rows outgrow short windows.
                     egui::ScrollArea::vertical().show(ui, |ui| self.overview(ui));
                 }
+                Section::Storage => self.storage_page(ui),
                 Section::Disk => self.disk_page(ui),
                 Section::Status => self.status_page(ui),
                 Section::Activity => self.activity_page(ui),
@@ -120,6 +125,7 @@ impl MacCleanUp {
                 Key::Num7,
                 Key::Num8,
                 Key::Num9,
+                Key::Num0,
             ]
             .into_iter()
             .enumerate()
@@ -225,6 +231,7 @@ impl MacCleanUp {
         let installers: u64 = state.installer_items.iter().map(|item| item.bytes).sum();
         let apps: u64 = state.app_items.iter().map(|item| item.bytes).sum();
         let mut measure = false;
+        let mut look = None;
 
         if let Some(disk) = state.status.as_ref().and_then(|status| status.disk) {
             let used = disk.total.saturating_sub(disk.available);
@@ -253,10 +260,12 @@ impl MacCleanUp {
                 });
             });
             ui.add_space(10.0);
-            strata_bar(ui, &strata, disk.total);
+            look = strata_bar(ui, &strata, disk.total);
             ui.add_space(10.0);
-            for (label, bytes, color) in &strata {
-                legend_row(ui, *color, label, *bytes, disk.total);
+            for stratum in &strata {
+                if legend_row(ui, stratum.color, &stratum.label, stratum.bytes, disk.total) {
+                    look = Some(stratum.part);
+                }
             }
             if let Some(breakdown) = &state.breakdown {
                 let mut unread = Vec::new();
@@ -396,6 +405,10 @@ impl MacCleanUp {
         }
         if measure {
             self.state.measure_storage();
+        }
+        if let Some(part) = look {
+            self.state.select_section(Section::Storage);
+            self.storage_focus = Some(part);
         }
     }
 
@@ -1001,7 +1014,7 @@ impl MacCleanUp {
             );
         });
         ui.add_space(8.0);
-        let extras = self.state.extras;
+        let extras = self.state.extras.as_ref();
         let pending = if self.state.is_stopped(Section::Status) {
             "Stopped. Press Cmd-R to read it."
         } else {
@@ -1020,10 +1033,10 @@ impl MacCleanUp {
                 ),
             };
             figure(&mut columns[0], "In the Trash", &trash, &detail);
-            let snapshots = match extras.map(|extras| extras.snapshots) {
+            let snapshots = match extras.map(|extras| extras.snapshots.as_ref()) {
                 None => pending.to_string(),
                 Some(None) => "Unavailable".to_string(),
-                Some(Some(count)) => count.to_string(),
+                Some(Some(names)) => names.len().to_string(),
             };
             figure(
                 &mut columns[1],
@@ -1069,9 +1082,304 @@ impl MacCleanUp {
         });
     }
 
+    // Storage ---------------------------------------------------------------
+
+    fn storage_page(&mut self, ui: &mut Ui) {
+        page_heading(ui, Section::Storage);
+        let mut measure = false;
+        ui.horizontal(|ui| {
+            let label = if self.state.breakdown.is_some() {
+                "Measure again"
+            } else {
+                "Measure your files and more"
+            };
+            if ui
+                .add_enabled(self.state.can_start(), egui::Button::new(label))
+                .on_hover_text("Measures Desktop, Documents, Downloads, Movies, Music, Pictures, developer tools, device backups, Mail and Messages, and the Trash. macOS may ask for access to some folders.")
+                .clicked()
+            {
+                measure = true;
+            }
+            if self.state.is_scanning(Section::Overview) {
+                scan_bar(ui, self.state.progress, ui.available_width());
+            }
+        });
+        ui.add_space(10.0);
+        let Some(disk) = self.state.status.as_ref().and_then(|status| status.disk) else {
+            empty_state(ui, "Reading the startup disk", "Sizes appear in a moment.");
+            return;
+        };
+        let used = disk.total.saturating_sub(disk.available);
+        let strata = storage_strata(&self.state, used, disk.available);
+        let mut focus = strata_bar(ui, &strata, disk.total);
+        ui.add_space(12.0);
+        let focused = self.storage_focus;
+        TableBuilder::new(ui)
+            .id_salt("storage")
+            .sense(Sense::click())
+            .cell_layout(Layout::left_to_right(Align::Center))
+            .column(Column::exact(14.0))
+            .column(Column::remainder().at_least(200.0).clip(true))
+            .column(Column::exact(96.0))
+            .column(Column::exact(64.0))
+            .header(26.0, |mut header| {
+                for label in ["", "Part", "Size", "Share"] {
+                    header.col(|ui| {
+                        ui.label(RichText::new(label).font(medium(12.5)).color(SILT));
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(30.0, strata.len(), |mut row| {
+                    let stratum = &strata[row.index()];
+                    row.set_selected(focused == Some(stratum.part));
+                    row.col(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                        ui.painter()
+                            .rect_filled(rect, CornerRadius::same(2), stratum.color);
+                    });
+                    row.col(|ui| {
+                        ui.label(RichText::new(&stratum.label).color(CHALK));
+                    });
+                    row.col(|ui| {
+                        ui.label(RichText::new(format_bytes(stratum.bytes)).font(medium(13.0)));
+                    });
+                    row.col(|ui| {
+                        ui.label(RichText::new(percent(stratum.bytes, disk.total)).color(SILT));
+                    });
+                    if row.response().clicked() {
+                        focus = Some(stratum.part);
+                    }
+                });
+            });
+        if focus.is_some() {
+            self.storage_focus = focus;
+        }
+        if measure {
+            self.state.measure_storage();
+        }
+    }
+
+    /// The details panel for the Storage view's selected part.
+    fn storage_inspector(&mut self, ui: &mut Ui) {
+        enum Act {
+            Disk(PathBuf),
+            Reveal(PathBuf),
+            Open(PathBuf),
+            Go(Section),
+            Measure,
+        }
+        let state = &self.state;
+        let home = state.home.clone();
+        let Some(part) = self.storage_focus else {
+            ui.label(RichText::new("Details").font(condensed(20.0)));
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Click a part to see what it holds and where to look at it.")
+                    .color(SILT),
+            );
+            return;
+        };
+        let mut act = None;
+        let entries = |wanted: StoragePart| -> Vec<(PathBuf, u64)> {
+            state
+                .breakdown
+                .iter()
+                .flat_map(|breakdown| &breakdown.entries)
+                .filter(|entry| entry.part == wanted)
+                .take(15)
+                .map(|entry| (entry.path.clone(), entry.size.bytes))
+                .collect()
+        };
+        // A path and its size; a click opens it.
+        let path_rows = |ui: &mut Ui, rows: &[(PathBuf, u64)], reveal: bool| -> Option<Act> {
+            let mut clicked = None;
+            for (path, bytes) in rows {
+                ui.horizontal(|ui| {
+                    let link = ui
+                        .add(
+                            egui::Label::new(RichText::new(tilde_path(path, &home)).color(CHALK))
+                                .truncate()
+                                .sense(Sense::click()),
+                        )
+                        .on_hover_text(if reveal {
+                            "Show in Finder"
+                        } else {
+                            "Open in the disk map"
+                        });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(format_bytes(*bytes)).small().color(SILT));
+                    });
+                    if link.clicked() {
+                        clicked = Some(if reveal || !path.is_dir() {
+                            Act::Reveal(path.clone())
+                        } else {
+                            Act::Disk(path.clone())
+                        });
+                    }
+                });
+            }
+            clicked
+        };
+        let names = |items: Vec<(String, u64)>, ui: &mut Ui| {
+            for (name, bytes) in items {
+                fact_row(ui, &name, bytes);
+            }
+        };
+        egui::ScrollArea::vertical().show(ui, |ui| match part {
+            Part::MacOs => {
+                inspector_title(ui, "macOS", "System volumes");
+                ui.label("macOS keeps itself on separate volumes that are sealed and read-only. Nothing here can go to the Trash; updates replace it as a whole.");
+                ui.add_space(10.0);
+                if let Some(volumes) = &state.volumes {
+                    names(volumes.macos_volumes.clone(), ui);
+                }
+            }
+            Part::Applications => {
+                inspector_title(ui, "Applications", "Largest first");
+                let mut apps: Vec<_> = state
+                    .app_items
+                    .iter()
+                    .map(|app| (app.name.clone(), app.bytes))
+                    .collect();
+                apps.sort_by_key(|app| std::cmp::Reverse(app.1));
+                apps.truncate(12);
+                names(apps, ui);
+                ui.add_space(10.0);
+                if ui.button("Review apps").clicked() {
+                    act = Some(Act::Go(Section::Applications));
+                }
+            }
+            Part::Files => {
+                inspector_title(ui, "Your files", "Largest folders first");
+                ui.label("Your own folders. The Photos library is left out, because reading it raises a privacy prompt; its size counts under System Data and other files.");
+                ui.add_space(10.0);
+                act = path_rows(ui, &entries(StoragePart::Files), false);
+            }
+            Part::Developer => {
+                inspector_title(ui, "Developer tools", "Toolchains and Xcode data");
+                if let Some(breakdown) = &state.breakdown {
+                    let listed = developer_caches(state, &breakdown.developer_roots);
+                    ui.label(format!(
+                        "Xcode data, Rust and npm toolchains, and Homebrew. {} of caches inside these folders count under Caches and logs instead.",
+                        format_bytes(listed)
+                    ));
+                }
+                ui.add_space(10.0);
+                act = path_rows(ui, &entries(StoragePart::Developer), false);
+            }
+            Part::Backups => {
+                inspector_title(ui, "iPhone and iPad backups", "One folder per device");
+                ui.label("To remove a backup, select the device in a Finder window's sidebar, then click Manage Backups.");
+                ui.add_space(10.0);
+                act = path_rows(ui, &entries(StoragePart::Backups), true);
+            }
+            Part::Mail => {
+                inspector_title(ui, "Mail and Messages", "Messages and attachments");
+                ui.label("Remove large attachments from inside Mail and Messages. Moving these folders breaks the apps.");
+                ui.add_space(10.0);
+                act = path_rows(ui, &entries(StoragePart::Mail), true);
+            }
+            Part::Installers => {
+                inspector_title(ui, "Installer files", "Disk images and packages");
+                if ui.button("Review installers").clicked() {
+                    act = Some(Act::Go(Section::Installers));
+                }
+            }
+            Part::Caches => {
+                inspector_title(ui, "Caches and logs", "Largest first");
+                let mut caches: Vec<_> = state
+                    .clean_items
+                    .iter()
+                    .map(|item| (friendly_name(&item.name, &state.app_names), item.bytes))
+                    .collect();
+                caches.sort_by_key(|cache| std::cmp::Reverse(cache.1));
+                caches.truncate(12);
+                names(caches, ui);
+                ui.add_space(10.0);
+                if ui.button("Review caches").clicked() {
+                    act = Some(Act::Go(Section::Clean));
+                }
+            }
+            Part::Trash => {
+                inspector_title(ui, "Trash", "Largest items first");
+                ui.label("Items in the Trash still use space until you empty it. MacCleanUp never empties the Trash.");
+                ui.add_space(10.0);
+                act = path_rows(ui, &entries(StoragePart::Trash), true);
+                ui.add_space(8.0);
+                if ui.button("Open the Trash").clicked() {
+                    act = Some(Act::Open(home.join(".Trash")));
+                }
+            }
+            Part::Swap => {
+                inspector_title(ui, "Swap and sleep image", "The VM volume");
+                ui.label("macOS moves memory it is not using into swap files here, and keeps the sleep image here. It manages this space by itself.");
+                if let Some(swap) = state.status.as_ref().and_then(|status| status.swap) {
+                    ui.add_space(10.0);
+                    fact(ui, "Swap in use", &format!("{} of {}", format_bytes(swap.used), format_bytes(swap.total)));
+                }
+            }
+            Part::Purgeable => {
+                inspector_title(ui, "Purgeable", "macOS frees this by itself");
+                ui.label("Space macOS gives back when it needs room. Most of it is Time Machine local snapshots: copies of the startup disk that macOS keeps between backups. MacCleanUp does not delete them.");
+                ui.add_space(10.0);
+                match state.extras.as_ref().and_then(|extras| extras.snapshots.as_ref()) {
+                    Some(names) if names.is_empty() => {
+                        ui.label(RichText::new("No local snapshots right now.").color(SILT));
+                    }
+                    Some(names) => {
+                        ui.label(RichText::new("Local snapshots").font(medium(13.0)).color(SILT));
+                        for name in names {
+                            ui.label(snapshot_label(name));
+                        }
+                    }
+                    None => {
+                        ui.label(RichText::new("The snapshot list could not be read.").color(SILT));
+                    }
+                }
+            }
+            Part::Rest => {
+                if state.breakdown.is_none() {
+                    inspector_title(ui, "Not measured yet", "Your files and the rest");
+                    ui.label("This holds your own files and everything else MacCleanUp has not measured yet.");
+                    ui.add_space(10.0);
+                    if ui.add_enabled(state.can_start(), egui::Button::new("Measure your files and more")).clicked() {
+                        act = Some(Act::Measure);
+                    }
+                } else {
+                    inspector_title(ui, "System Data and other files", "What is left");
+                    ui.label("Mostly app data and containers in your Library, the Photos library, iCloud files kept on this Mac, and logs and caches not in the list. MacCleanUp cannot read all of it without Full Disk Access.");
+                    ui.add_space(10.0);
+                    if ui.button("Open your Library in the disk map").clicked() {
+                        act = Some(Act::Disk(home.join("Library")));
+                    }
+                }
+            }
+            Part::Free => {
+                inspector_title(ui, "Free", "Ready to use");
+                ui.label("Space free right now. When it runs low, macOS also frees the Purgeable space.");
+            }
+        });
+        match act {
+            Some(Act::Disk(path)) if self.state.can_start() => {
+                self.state.select_section(Section::Disk);
+                self.state.open_folder(path);
+            }
+            Some(Act::Reveal(path)) => reveal_in_finder(&path),
+            Some(Act::Open(path)) => open_in_finder(&path),
+            Some(Act::Go(section)) => self.state.select_section(section),
+            Some(Act::Measure) => self.state.measure_storage(),
+            _ => {}
+        }
+    }
+
     // Inspector -------------------------------------------------------------
 
     fn inspector(&mut self, ui: &mut Ui) {
+        if self.state.section == Section::Storage {
+            self.storage_inspector(ui);
+            return;
+        }
         // A focused item hidden by the filter is not shown.
         let visible = !is_list(self.state.section)
             || self
@@ -1438,92 +1746,140 @@ impl eframe::App for MacCleanUp {
 // Small drawing helpers ------------------------------------------------------
 
 fn has_inspector(section: Section) -> bool {
-    is_list(section) || section == Section::Disk
+    is_list(section) || matches!(section, Section::Disk | Section::Storage)
 }
 
 fn is_list(section: Section) -> bool {
     section == Section::Applications || section.has_clean_items()
 }
 
+/// One part of the startup disk in the storage bar and the Storage view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Part {
+    MacOs,
+    Applications,
+    Files,
+    Developer,
+    Backups,
+    Mail,
+    Installers,
+    Caches,
+    Trash,
+    Swap,
+    Purgeable,
+    Rest,
+    Free,
+}
+
+struct Stratum {
+    part: Part,
+    label: String,
+    bytes: u64,
+    color: Color32,
+}
+
+/// Bytes of the caches list that sit inside the developer folders, such as
+/// DerivedData, simulator caches and the npm cache.
+fn developer_caches(state: &State, roots: &[PathBuf]) -> u64 {
+    state
+        .clean_items
+        .iter()
+        .filter(|item| roots.iter().any(|root| item.path.starts_with(root)))
+        .map(|item| item.bytes)
+        .sum()
+}
+
 /// The storage bar's parts, in a fixed order with a fixed color each, then
 /// what is left and the free space. Parts the app has not measured are left
 /// out, and the remainder's label says what it still holds.
-fn storage_strata(state: &State, used: u64, available: u64) -> Vec<(String, u64, Color32)> {
+fn storage_strata(state: &State, used: u64, available: u64) -> Vec<Stratum> {
     let total = |items: &[CleanItem]| items.iter().map(|item| item.bytes).sum::<u64>();
-    let mut parts: Vec<(&str, u64, usize)> = Vec::new();
-    if let Some(volumes) = state.volumes {
-        parts.push(("macOS", volumes.macos, 8));
+    let mut parts: Vec<(Part, &str, u64, usize)> = Vec::new();
+    if let Some(volumes) = &state.volumes {
+        parts.push((Part::MacOs, "macOS", volumes.macos, 8));
     }
     if state.is_loaded(Section::Applications) {
         let apps = state.app_items.iter().map(|app| app.bytes).sum();
-        parts.push(("Applications", apps, 0));
+        parts.push((Part::Applications, "Applications", apps, 0));
     }
     match &state.breakdown {
         Some(breakdown) => {
-            parts.push(("Your files", breakdown.files.bytes, 2));
-            // The caches list already counts DerivedData, simulator caches
-            // and the npm cache, which sit inside these folders.
-            let listed: u64 = state
-                .clean_items
-                .iter()
-                .filter(|item| {
-                    breakdown
-                        .developer_roots
-                        .iter()
-                        .any(|root| item.path.starts_with(root))
-                })
-                .map(|item| item.bytes)
-                .sum();
+            parts.push((Part::Files, "Your files", breakdown.files.bytes, 2));
+            // Counted once, under Caches and logs.
+            let listed = developer_caches(state, &breakdown.developer_roots);
             parts.push((
+                Part::Developer,
                 "Developer tools",
                 breakdown.developer.bytes.saturating_sub(listed),
                 3,
             ));
             if let Some(backups) = breakdown.backups {
-                parts.push(("iPhone and iPad backups", backups.bytes, 4));
+                parts.push((Part::Backups, "iPhone and iPad backups", backups.bytes, 4));
             }
             if let Some(mail) = breakdown.mail {
-                parts.push(("Mail and Messages", mail.bytes, 5));
+                parts.push((Part::Mail, "Mail and Messages", mail.bytes, 5));
             }
         }
         None if state.is_loaded(Section::Installers) => {
-            parts.push(("Installer files", total(&state.installer_items), 2));
+            let installers = total(&state.installer_items);
+            parts.push((Part::Installers, "Installer files", installers, 2));
         }
         None => {}
     }
     if state.is_loaded(Section::Clean) {
-        parts.push(("Caches and logs", total(&state.clean_items), 1));
+        parts.push((
+            Part::Caches,
+            "Caches and logs",
+            total(&state.clean_items),
+            1,
+        ));
     }
     if let Some(trash) = state
         .breakdown
         .as_ref()
         .and_then(|breakdown| breakdown.trash)
     {
-        parts.push(("Trash", trash.bytes, 6));
+        parts.push((Part::Trash, "Trash", trash.bytes, 6));
     }
-    if let Some(volumes) = state.volumes {
-        parts.push(("Swap and sleep image", volumes.vm, 9));
+    if let Some(volumes) = &state.volumes {
+        parts.push((Part::Swap, "Swap and sleep image", volumes.vm, 9));
         if let Some(purgeable) = volumes.purgeable {
             parts.push((
+                Part::Purgeable,
                 "Purgeable: Time Machine snapshots and other space macOS frees by itself",
                 purgeable,
                 7,
             ));
         }
     }
-    let measured: u64 = parts.iter().map(|(_, bytes, _)| bytes).sum();
-    let mut strata: Vec<(String, u64, Color32)> = parts
+    let measured: u64 = parts.iter().map(|(_, _, bytes, _)| bytes).sum();
+    let mut strata: Vec<Stratum> = parts
         .into_iter()
-        .filter(|(_, bytes, _)| *bytes > 0)
-        .map(|(label, bytes, color)| (label.to_string(), bytes, STRATA[color]))
+        .filter(|(_, _, bytes, _)| *bytes > 0)
+        .map(|(part, label, bytes, color)| Stratum {
+            part,
+            label: label.to_string(),
+            bytes,
+            color: STRATA[color],
+        })
         .collect();
     let rest = if state.breakdown.is_some() {
         "System Data and other files"
     } else {
         "Your files, System Data and everything else (not measured yet)"
     };
-    strata.push((rest.to_string(), used.saturating_sub(measured), RIDGE));
-    strata.push(("Free".to_string(), available, SHALE.gamma_multiply(0.6)));
+    strata.push(Stratum {
+        part: Part::Rest,
+        label: rest.to_string(),
+        bytes: used.saturating_sub(measured),
+        color: RIDGE,
+    });
+    strata.push(Stratum {
+        part: Part::Free,
+        label: "Free".to_string(),
+        bytes: available,
+        color: SHALE.gamma_multiply(0.6),
+    });
     strata
 }
 
@@ -1690,25 +2046,26 @@ fn nav_row(ui: &mut Ui, title: &str, hint: &str, active: bool) -> egui::Response
 }
 
 /// The storage "core sample": one bar, each stratum proportional to its bytes.
-fn strata_bar(ui: &mut Ui, strata: &[(String, u64, Color32)], total: u64) {
+/// Draws the storage bar and returns the part under a click, if any.
+fn strata_bar(ui: &mut Ui, strata: &[Stratum], total: u64) -> Option<Part> {
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), Sense::hover());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), Sense::click());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, CornerRadius::same(6), SEAM);
     let mut x = rect.left();
     let mut hovered = None;
-    for (index, (label, bytes, color)) in strata.iter().enumerate() {
-        let width = rect.width() * ratio(*bytes, total);
+    for (index, stratum) in strata.iter().enumerate() {
+        let width = rect.width() * ratio(stratum.bytes, total);
         let segment = Rect::from_min_max(
             Pos2::new(x, rect.top()),
             Pos2::new(x + width, rect.bottom()),
         );
-        painter.rect_filled(segment, CornerRadius::ZERO, *color);
+        painter.rect_filled(segment, CornerRadius::ZERO, stratum.color);
         if response
             .hover_pos()
             .is_some_and(|pos| segment.contains(pos))
         {
-            hovered = Some((label.clone(), *bytes));
+            hovered = Some((stratum.label.clone(), stratum.bytes, stratum.part));
         }
         if index + 1 < strata.len() && width > 1.0 {
             painter.line_segment(
@@ -1727,22 +2084,33 @@ fn strata_bar(ui: &mut Ui, strata: &[(String, u64, Color32)], total: u64) {
         Stroke::new(1.0, SHALE),
         StrokeKind::Inside,
     );
-    if let Some((label, bytes)) = hovered {
-        response.on_hover_text(format!("{label}: {}", format_bytes(bytes)));
+    let clicked = response.clicked();
+    let part = hovered.as_ref().map(|(_, _, part)| *part);
+    if let Some((label, bytes, _)) = hovered {
+        response.on_hover_text(format!(
+            "{label}: {}\nClick to see what it holds",
+            format_bytes(bytes)
+        ));
     }
+    part.filter(|_| clicked)
 }
 
-fn legend_row(ui: &mut Ui, color: Color32, label: &str, bytes: u64, total: u64) {
+/// One legend row; returns true when it was clicked.
+fn legend_row(ui: &mut Ui, color: Color32, label: &str, bytes: u64, total: u64) -> bool {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
         ui.painter().rect_filled(rect, CornerRadius::same(2), color);
-        ui.label(RichText::new(label).color(CHALK));
+        let name = ui
+            .add(egui::Label::new(RichText::new(label).color(CHALK)).sense(Sense::click()))
+            .on_hover_text("See what it holds");
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(RichText::new(percent(bytes, total)).color(SILT));
             ui.add_space(12.0);
             ui.label(RichText::new(format_bytes(bytes)).font(medium(13.0)));
         });
-    });
+        name.clicked()
+    })
+    .inner
 }
 
 fn metric(ui: &mut Ui, label: &str, value: &str, detail: &str, share: f32, color: Color32) {
@@ -1894,6 +2262,45 @@ fn clock(when: SystemTime) -> String {
 }
 
 /// Selects the item in Finder. Runs only on an explicit button press.
+/// "com.apple.TimeMachine.2026-11-23-092637.local" becomes
+/// "2026-11-23 09:26:37". Other names pass through unchanged.
+fn snapshot_label(name: &str) -> String {
+    let stamp = name
+        .strip_prefix("com.apple.TimeMachine.")
+        .and_then(|rest| rest.split(".local").next())
+        .filter(|stamp| stamp.len() == 17 && stamp.as_bytes()[10] == b'-');
+    match stamp {
+        Some(stamp) => format!(
+            "{} {}:{}:{}",
+            &stamp[..10],
+            &stamp[11..13],
+            &stamp[13..15],
+            &stamp[15..17]
+        ),
+        None => name.to_string(),
+    }
+}
+
+/// A name and its size on one line.
+fn fact_row(ui: &mut Ui, name: &str, bytes: u64) {
+    ui.horizontal(|ui| {
+        ui.add(egui::Label::new(RichText::new(name).color(CHALK)).truncate());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new(format_bytes(bytes)).small().color(SILT));
+        });
+    });
+}
+
+/// Opens a folder in Finder. Runs only on an explicit button press.
+fn open_in_finder(path: &Path) {
+    if let Ok(mut child) = std::process::Command::new("/usr/bin/open")
+        .arg(path)
+        .spawn()
+    {
+        std::thread::spawn(move || child.wait());
+    }
+}
+
 fn reveal_in_finder(path: &Path) {
     if let Ok(mut child) = std::process::Command::new("/usr/bin/open")
         .arg("-R")
@@ -2121,13 +2528,15 @@ mod tests {
         let mut state = State::new(home.clone());
         let before = storage_strata(&state, 1_000, 500);
         assert_eq!(before.len(), 2, "nothing measured yet: remainder and free");
-        assert!(before[0].0.contains("not measured yet"));
+        assert!(before[0].label.contains("not measured yet"));
+        assert_eq!(before[0].part, Part::Rest);
 
         state.volumes = Some(VolumeUsage {
             macos: 100,
             data: 800,
             vm: 50,
             purgeable: Some(25),
+            ..Default::default()
         });
         let developer = home.join("Library/Developer");
         state.scan(Section::Clean);
@@ -2165,13 +2574,14 @@ mod tests {
                 bytes: 10,
                 complete: true,
             }),
+            ..Default::default()
         });
         let strata = storage_strata(&state, 1_000, 500);
         let part = |label: &str| {
             strata
                 .iter()
-                .find(|(name, _, _)| name.starts_with(label))
-                .map(|(_, bytes, _)| *bytes)
+                .find(|stratum| stratum.label.starts_with(label))
+                .map(|stratum| stratum.bytes)
         };
         assert_eq!(part("macOS"), Some(100));
         assert_eq!(part("Your files"), Some(300));
@@ -2208,10 +2618,15 @@ mod tests {
             let share = |percent: u64| total / 100 * percent;
             state.volumes = Some(VolumeUsage {
                 macos: share(5),
+                macos_volumes: vec![
+                    ("Macintosh HD".to_string(), share(3)),
+                    ("Preboot".to_string(), share(2)),
+                ],
                 data: share(85),
                 vm: share(2),
                 purgeable: Some(share(1)),
             });
+            let documents = state.home.join("Documents");
             state.breakdown = Some(Breakdown {
                 files: Size {
                     bytes: share(40),
@@ -2231,6 +2646,20 @@ mod tests {
                     bytes: share(1),
                     complete: true,
                 }),
+                entries: vec![maccleanup::system::StorageEntry {
+                    part: StoragePart::Files,
+                    path: documents,
+                    size: Size {
+                        bytes: share(40),
+                        complete: true,
+                    },
+                }],
+            });
+            state.extras = Some(maccleanup::system::StorageExtras {
+                trash: None,
+                snapshots: Some(vec![
+                    "com.apple.TimeMachine.2026-11-23-092637.local".to_string()
+                ]),
             });
         }
         harness.run_steps(3);
@@ -2241,6 +2670,22 @@ mod tests {
         harness.get_by_label_contains("Full Disk Access");
         harness.get_by_label("Measure again");
         shot(&mut harness, "overview-breakdown");
+
+        // A legend row opens that part in the Storage tab.
+        harness.get_by_label("Your files").click();
+        harness.run_steps(3);
+        assert_eq!(harness.state().state.section, Section::Storage);
+        assert_eq!(harness.state().storage_focus, Some(Part::Files));
+        harness.get_by_label("Largest folders first");
+        harness.get_by_label("~/Documents");
+        shot(&mut harness, "storage-files");
+        harness.state_mut().storage_focus = Some(Part::Purgeable);
+        harness.run_steps(2);
+        harness.get_by_label("2026-11-23 09:26:37");
+        shot(&mut harness, "storage-purgeable");
+        harness.state_mut().storage_focus = Some(Part::MacOs);
+        harness.run_steps(2);
+        harness.get_by_label("Macintosh HD");
     }
 
     #[test]
@@ -2387,5 +2832,10 @@ mod tests {
         assert_eq!(grouped(999), "999");
         assert_eq!(grouped(1_000), "1,000");
         assert_eq!(grouped(1_234_567), "1,234,567");
+        assert_eq!(
+            snapshot_label("com.apple.TimeMachine.2026-11-23-092637.local (dataless)"),
+            "2026-11-23 09:26:37"
+        );
+        assert_eq!(snapshot_label("something else"), "something else");
     }
 }
