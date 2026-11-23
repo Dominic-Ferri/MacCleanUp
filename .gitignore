@@ -1,0 +1,7 @@
+/target/
+/build/
+/assets/*-rendered/
+/assets/MacCleanUp.iconset/
+.DS_Store
+*.bak.*
+.env*

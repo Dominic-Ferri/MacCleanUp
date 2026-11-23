@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect x="32" y="32" width="960" height="960" rx="218" fill="#10161D"/>
+  <rect x="49" y="49" width="926" height="926" rx="201" fill="none" stroke="#263845" stroke-width="4"/>
+
+  <ellipse cx="512" cy="654" rx="248" ry="254" fill="#9C4F2E"/>
+
+  <circle cx="316" cy="400" r="94" fill="#9C4F2E"/>
+  <circle cx="708" cy="400" r="94" fill="#9C4F2E"/>
+  <circle cx="316" cy="400" r="52" fill="#D98C84"/>
+  <circle cx="708" cy="400" r="52" fill="#D98C84"/>
+
+  <ellipse cx="512" cy="450" rx="250" ry="230" fill="#C87545"/>
+  <ellipse cx="440" cy="510" rx="135" ry="120" fill="#F0C8A8"/>
+  <ellipse cx="584" cy="510" rx="135" ry="120" fill="#F0C8A8"/>
+
+  <circle cx="420" cy="410" r="22" fill="#21191A"/>
+  <circle cx="604" cy="410" r="22" fill="#21191A"/>
+  <circle cx="412" cy="402" r="7" fill="#E5EDF2"/>
+  <circle cx="596" cy="402" r="7" fill="#E5EDF2"/>
+
+  <path d="M280 350 Q290 145 512 125 Q734 145 744 350 Z" fill="#C7542F"/>
+  <path d="M512 130 Q460 230 470 340" fill="none" stroke="#E07B42" stroke-width="24" stroke-linecap="round"/>
+  <rect x="245" y="325" width="534" height="82" rx="41" fill="#E07B42"/>
+  <rect x="267" y="383" width="490" height="24" rx="12" fill="#9C3F26"/>
+
+  <circle cx="512" cy="270" r="82" fill="#263845"/>
+  <circle cx="512" cy="270" r="54" fill="#56C2D6"/>
+  <circle cx="492" cy="250" r="16" fill="#E5EDF2"/>
+
+  <ellipse cx="512" cy="480" rx="65" ry="45" fill="#2B1B1B"/>
+  <ellipse cx="490" cy="462" rx="18" ry="10" fill="#6B4740"/>
+
+  <g fill="none" stroke="#F0C8A8" stroke-width="12" stroke-linecap="round">
+    <path d="M365 480 L220 440"/>
+    <path d="M360 520 L210 520"/>
+    <path d="M370 555 L235 610"/>
+    <path d="M659 480 L804 440"/>
+    <path d="M664 520 L814 520"/>
+    <path d="M654 555 L789 610"/>
+  </g>
+
+  <rect x="475" y="555" width="36" height="66" rx="8" fill="#E5EDF2"/>
+  <rect x="513" y="555" width="36" height="66" rx="8" fill="#E5EDF2"/>
+
+  <ellipse cx="300" cy="760" rx="100" ry="72" fill="#C87545" transform="rotate(18 300 760)"/>
+  <ellipse cx="724" cy="760" rx="100" ry="72" fill="#C87545" transform="rotate(-18 724 760)"/>
+  <g fill="none" stroke="#E5EDF2" stroke-width="16" stroke-linecap="round">
+    <path d="M248 774 L226 802"/>
+    <path d="M284 784 L272 818"/>
+    <path d="M320 786 L320 820"/>
+    <path d="M776 774 L798 802"/>
+    <path d="M740 784 L752 818"/>
+    <path d="M704 786 L704 820"/>
+  </g>
+
+  <g transform="translate(512 735)">
+    <g fill="#C7542F">
+      <rect x="-14" y="-100" width="28" height="44" rx="6"/>
+      <rect x="-14" y="-100" width="28" height="44" rx="6" transform="rotate(45)"/>
+      <rect x="-14" y="-100" width="28" height="44" rx="6" transform="rotate(90)"/>
+      <rect x="-14" y="-100" width="28" height="44" rx="6" transform="rotate(135)"/>
+      <rect x="-14" y="-100" width="28" height="44" rx="6" transform="rotate(180)"/>
+      <rect x="-14" y="-100" width="28" height="44" rx="6" transform="rotate(225)"/>
+      <rect x="-14" y="-100" width="28" height="44" rx="6" transform="rotate(270)"/>
+      <rect x="-14" y="-100" width="28" height="44" rx="6" transform="rotate(315)"/>
+      <circle r="78"/>
+    </g>
+    <circle r="48" fill="#10161D"/>
+    <text x="0" y="27" text-anchor="middle" font-family="DejaVu Sans" font-weight="700" font-size="76" fill="#E5EDF2">R</text>
+  </g>
+
+  <path d="M148 870 Q240 810 342 850 Q442 892 512 850 Q590 808 690 850 Q794 892 876 848 L876 922 L148 922 Z" fill="#3B2A26"/>
+</svg>
