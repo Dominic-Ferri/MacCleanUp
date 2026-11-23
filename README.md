@@ -33,7 +33,7 @@ Scans measure folders on all processor cores. A progress bar in the status bar, 
 
 Lists can be filtered by name and sorted by name, size, or last change.
 
-Version 0.4.1 does not implement Mole's Optimize, Purge, Slim, Touch ID, update, or administrator-only workflows.
+Version 0.4.2 does not implement Mole's Optimize, Purge, Slim, Touch ID, update, or administrator-only workflows.
 
 ## Keyboard
 

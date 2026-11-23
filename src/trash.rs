@@ -220,9 +220,11 @@ fn trash_with_finder(path: &Path) -> Result<(), String> {
             "-e",
             "on run argv",
             "-e",
-            "set target to POSIX file (item 1 of argv) as alias",
+            // Not "target": inside a Finder tell block that word is Finder's
+            // own property, and the delete fails with -1728.
+            "set reviewedItem to POSIX file (item 1 of argv) as alias",
             "-e",
-            "tell application \"Finder\" to delete target",
+            "tell application \"Finder\" to delete reviewedItem",
             "-e",
             "end run",
         ])
