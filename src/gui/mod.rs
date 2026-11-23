@@ -224,35 +224,11 @@ impl MacCleanUp {
         let clean: u64 = state.clean_items.iter().map(|item| item.bytes).sum();
         let installers: u64 = state.installer_items.iter().map(|item| item.bytes).sum();
         let apps: u64 = state.app_items.iter().map(|item| item.bytes).sum();
+        let mut measure = false;
 
         if let Some(disk) = state.status.as_ref().and_then(|status| status.disk) {
             let used = disk.total.saturating_sub(disk.available);
-            let measured = [
-                ("Applications", apps, state.is_loaded(Section::Applications)),
-                ("Caches and logs", clean, state.is_loaded(Section::Clean)),
-                (
-                    "Installer files",
-                    installers,
-                    state.is_loaded(Section::Installers),
-                ),
-            ];
-            let known: u64 = measured.iter().map(|(_, bytes, _)| *bytes).sum();
-            let mut strata: Vec<(String, u64, Color32)> = measured
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, bytes, loaded))| *loaded && *bytes > 0)
-                .map(|(index, (label, bytes, _))| (label.to_string(), *bytes, STRATA[index]))
-                .collect();
-            strata.push((
-                "Everything else in use (not measured)".to_string(),
-                used.saturating_sub(known),
-                RIDGE,
-            ));
-            strata.push((
-                "Free".to_string(),
-                disk.available,
-                SHALE.gamma_multiply(0.6),
-            ));
+            let strata = storage_strata(state, used, disk.available);
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -282,6 +258,46 @@ impl MacCleanUp {
             for (label, bytes, color) in &strata {
                 legend_row(ui, *color, label, *bytes, disk.total);
             }
+            if let Some(breakdown) = &state.breakdown {
+                let mut unread = Vec::new();
+                if breakdown.backups.is_none() {
+                    unread.push("iPhone and iPad backups");
+                }
+                if breakdown.mail.is_none() {
+                    unread.push("Mail and Messages");
+                }
+                if breakdown.trash.is_none() {
+                    unread.push("the Trash");
+                }
+                if !unread.is_empty() {
+                    ui.label(
+                        RichText::new(format!(
+                            "macOS did not let MacCleanUp read {}, or they are not on this Mac. To include them, add MacCleanUp under Full Disk Access in System Settings, Privacy & Security.",
+                            unread.join(", ")
+                        ))
+                        .small()
+                        .color(SILT),
+                    );
+                }
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let label = if state.breakdown.is_some() {
+                    "Measure again"
+                } else {
+                    "Measure your files and more"
+                };
+                if ui
+                    .add_enabled(state.can_start(), egui::Button::new(label))
+                    .on_hover_text("Measures Desktop, Documents, Downloads, Movies, Music, Pictures, developer tools, device backups, Mail and Messages, and the Trash. macOS may ask for access to some folders.")
+                    .clicked()
+                {
+                    measure = true;
+                }
+                if state.is_scanning(Section::Overview) {
+                    scan_bar(ui, state.progress, 320.0);
+                }
+            });
         }
 
         ui.add_space(26.0);
@@ -377,6 +393,9 @@ impl MacCleanUp {
             if section.has_clean_items() && !self.state.is_loaded(section) {
                 self.state.scan(section);
             }
+        }
+        if measure {
+            self.state.measure_storage();
         }
     }
 
@@ -1426,6 +1445,88 @@ fn is_list(section: Section) -> bool {
     section == Section::Applications || section.has_clean_items()
 }
 
+/// The storage bar's parts, in a fixed order with a fixed color each, then
+/// what is left and the free space. Parts the app has not measured are left
+/// out, and the remainder's label says what it still holds.
+fn storage_strata(state: &State, used: u64, available: u64) -> Vec<(String, u64, Color32)> {
+    let total = |items: &[CleanItem]| items.iter().map(|item| item.bytes).sum::<u64>();
+    let mut parts: Vec<(&str, u64, usize)> = Vec::new();
+    if let Some(volumes) = state.volumes {
+        parts.push(("macOS", volumes.macos, 8));
+    }
+    if state.is_loaded(Section::Applications) {
+        let apps = state.app_items.iter().map(|app| app.bytes).sum();
+        parts.push(("Applications", apps, 0));
+    }
+    match &state.breakdown {
+        Some(breakdown) => {
+            parts.push(("Your files", breakdown.files.bytes, 2));
+            // The caches list already counts DerivedData, simulator caches
+            // and the npm cache, which sit inside these folders.
+            let listed: u64 = state
+                .clean_items
+                .iter()
+                .filter(|item| {
+                    breakdown
+                        .developer_roots
+                        .iter()
+                        .any(|root| item.path.starts_with(root))
+                })
+                .map(|item| item.bytes)
+                .sum();
+            parts.push((
+                "Developer tools",
+                breakdown.developer.bytes.saturating_sub(listed),
+                3,
+            ));
+            if let Some(backups) = breakdown.backups {
+                parts.push(("iPhone and iPad backups", backups.bytes, 4));
+            }
+            if let Some(mail) = breakdown.mail {
+                parts.push(("Mail and Messages", mail.bytes, 5));
+            }
+        }
+        None if state.is_loaded(Section::Installers) => {
+            parts.push(("Installer files", total(&state.installer_items), 2));
+        }
+        None => {}
+    }
+    if state.is_loaded(Section::Clean) {
+        parts.push(("Caches and logs", total(&state.clean_items), 1));
+    }
+    if let Some(trash) = state
+        .breakdown
+        .as_ref()
+        .and_then(|breakdown| breakdown.trash)
+    {
+        parts.push(("Trash", trash.bytes, 6));
+    }
+    if let Some(volumes) = state.volumes {
+        parts.push(("Swap and sleep image", volumes.vm, 9));
+        if let Some(purgeable) = volumes.purgeable {
+            parts.push((
+                "Purgeable: Time Machine snapshots and other space macOS frees by itself",
+                purgeable,
+                7,
+            ));
+        }
+    }
+    let measured: u64 = parts.iter().map(|(_, bytes, _)| bytes).sum();
+    let mut strata: Vec<(String, u64, Color32)> = parts
+        .into_iter()
+        .filter(|(_, bytes, _)| *bytes > 0)
+        .map(|(label, bytes, color)| (label.to_string(), bytes, STRATA[color]))
+        .collect();
+    let rest = if state.breakdown.is_some() {
+        "System Data and other files"
+    } else {
+        "Your files, System Data and everything else (not measured yet)"
+    };
+    strata.push((rest.to_string(), used.saturating_sub(measured), RIDGE));
+    strata.push(("Free".to_string(), available, SHALE.gamma_multiply(0.6)));
+    strata
+}
+
 /// An Overview row for a search that waits for a click.
 fn search_row(
     state: &State,
@@ -2009,6 +2110,137 @@ mod tests {
             .click();
         harness.run_steps(2);
         assert!(harness.state().state.app_items[0].include_data);
+    }
+
+    #[test]
+    fn storage_bar_names_each_part_and_counts_developer_caches_once() {
+        use maccleanup::model::CleanCategory;
+        use maccleanup::scanner::Size;
+        use maccleanup::system::{Breakdown, VolumeUsage};
+        let home = fixture_home();
+        let mut state = State::new(home.clone());
+        let before = storage_strata(&state, 1_000, 500);
+        assert_eq!(before.len(), 2, "nothing measured yet: remainder and free");
+        assert!(before[0].0.contains("not measured yet"));
+
+        state.volumes = Some(VolumeUsage {
+            macos: 100,
+            data: 800,
+            vm: 50,
+            purgeable: Some(25),
+        });
+        let developer = home.join("Library/Developer");
+        state.scan(Section::Clean);
+        while state.busy.is_some() {
+            state.poll_worker();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        state.clean_items = vec![CleanItem {
+            id: "derived".to_string(),
+            category: CleanCategory::Developer,
+            name: "DerivedData".to_string(),
+            path: developer.join("Xcode/DerivedData/App"),
+            bytes: 40,
+            selected: false,
+            complete: true,
+            identity: None,
+            modified: None,
+        }];
+        state.breakdown = Some(Breakdown {
+            files: Size {
+                bytes: 300,
+                complete: true,
+            },
+            developer: Size {
+                bytes: 140,
+                complete: true,
+            },
+            developer_roots: vec![developer],
+            backups: Some(Size {
+                bytes: 60,
+                complete: true,
+            }),
+            mail: None,
+            trash: Some(Size {
+                bytes: 10,
+                complete: true,
+            }),
+        });
+        let strata = storage_strata(&state, 1_000, 500);
+        let part = |label: &str| {
+            strata
+                .iter()
+                .find(|(name, _, _)| name.starts_with(label))
+                .map(|(_, bytes, _)| *bytes)
+        };
+        assert_eq!(part("macOS"), Some(100));
+        assert_eq!(part("Your files"), Some(300));
+        assert_eq!(
+            part("Developer tools"),
+            Some(100),
+            "DerivedData counted under caches"
+        );
+        assert_eq!(part("Caches and logs"), Some(40));
+        assert_eq!(part("iPhone and iPad backups"), Some(60));
+        assert_eq!(
+            part("Mail and Messages"),
+            None,
+            "unreadable parts are left out"
+        );
+        assert_eq!(part("Trash"), Some(10));
+        assert_eq!(part("Swap and sleep image"), Some(50));
+        assert_eq!(part("Purgeable"), Some(25));
+        // 1000 used - (100 + 300 + 100 + 60 + 40 + 10 + 50 + 25) = 315.
+        assert_eq!(part("System Data and other files"), Some(315));
+        assert_eq!(part("Free"), Some(500));
+    }
+
+    #[test]
+    fn overview_shows_the_full_storage_breakdown() {
+        use maccleanup::scanner::Size;
+        use maccleanup::system::{Breakdown, VolumeUsage};
+        let mut harness = harness(fixture_home());
+        settle(&mut harness);
+        settle(&mut harness);
+        {
+            let state = &mut harness.state_mut().state;
+            let total = state.status.as_ref().unwrap().disk.unwrap().total;
+            let share = |percent: u64| total / 100 * percent;
+            state.volumes = Some(VolumeUsage {
+                macos: share(5),
+                data: share(85),
+                vm: share(2),
+                purgeable: Some(share(1)),
+            });
+            state.breakdown = Some(Breakdown {
+                files: Size {
+                    bytes: share(40),
+                    complete: true,
+                },
+                developer: Size {
+                    bytes: share(20),
+                    complete: true,
+                },
+                developer_roots: Vec::new(),
+                backups: Some(Size {
+                    bytes: share(6),
+                    complete: true,
+                }),
+                mail: None,
+                trash: Some(Size {
+                    bytes: share(1),
+                    complete: true,
+                }),
+            });
+        }
+        harness.run_steps(3);
+        harness.get_by_label("Your files");
+        harness.get_by_label("Developer tools");
+        harness.get_by_label("Swap and sleep image");
+        harness.get_by_label("System Data and other files");
+        harness.get_by_label_contains("Full Disk Access");
+        harness.get_by_label("Measure again");
+        shot(&mut harness, "overview-breakdown");
     }
 
     #[test]

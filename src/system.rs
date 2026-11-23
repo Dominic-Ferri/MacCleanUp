@@ -1,6 +1,12 @@
 use crate::scanner::Control;
 use crate::scanner::{measure_all, Size};
-use objc2_foundation::NSProcessInfo;
+use objc2::runtime::AnyObject;
+use objc2::{msg_send, ClassType};
+use objc2_foundation::{
+    NSArray, NSData, NSDictionary, NSNumber, NSProcessInfo, NSPropertyListMutabilityOptions,
+    NSPropertyListSerialization, NSString, NSURLVolumeAvailableCapacityForImportantUsageKey,
+    NSURLVolumeAvailableCapacityKey, NSURL,
+};
 use std::ffi::CString;
 use std::mem::{size_of, MaybeUninit};
 use std::path::{Path, PathBuf};
@@ -54,6 +60,271 @@ fn count_snapshots(listing: &str) -> usize {
         .lines()
         .filter(|line| line.trim_start().starts_with("com.apple.TimeMachine."))
         .count()
+}
+
+/// How the startup disk's APFS container is used, by volume role.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VolumeUsage {
+    /// The System, Preboot, Recovery, Update and other macOS volumes.
+    pub macos: u64,
+    /// The Data volume: apps, your files, and everything else you add.
+    pub data: u64,
+    /// The VM volume: swap files and the sleep image.
+    pub vm: u64,
+    /// Space macOS frees by itself when it needs room, such as Time Machine
+    /// local snapshots. None when macOS does not report it.
+    pub purgeable: Option<u64>,
+}
+
+/// Reads per-volume use with `diskutil apfs list -plist`, which needs no
+/// administrator rights and changes nothing, and the purgeable estimate from
+/// the Data volume's resource values.
+pub fn volume_usage() -> Option<VolumeUsage> {
+    let container = root_container()?;
+    let output = std::process::Command::new("/usr/sbin/diskutil")
+        .args(["apfs", "list", "-plist"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut usage = container_usage(&output.stdout, &container)?;
+    usage.purgeable = purgeable_bytes();
+    Some(usage)
+}
+
+/// The APFS container of the startup volume, such as `disk3` for
+/// `/dev/disk3s1s1`.
+fn root_container() -> Option<String> {
+    let path = CString::new("/").ok()?;
+    let mut stats = MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    let device = unsafe { std::ffi::CStr::from_ptr(stats.f_mntfromname.as_ptr()) };
+    container_of(device.to_str().ok()?)
+}
+
+fn container_of(device: &str) -> Option<String> {
+    let name = device.strip_prefix("/dev/")?;
+    let digits = name
+        .strip_prefix("disk")?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .count();
+    (digits > 0).then(|| name[..4 + digits].to_string())
+}
+
+/// Returns `object` as a `T` when the runtime says it is one. objc2 cannot
+/// downcast to generic collection types, so the class is checked here.
+fn instance_of<T: ClassType>(object: &AnyObject) -> Option<&T> {
+    let is_kind: bool = unsafe { msg_send![object, isKindOfClass: T::class()] };
+    // SAFETY: the runtime confirmed that the object is a T or a subclass.
+    is_kind.then(|| unsafe { &*(object as *const AnyObject).cast::<T>() })
+}
+
+type PlistDictionary = NSDictionary<NSString, AnyObject>;
+type PlistArray = NSArray<AnyObject>;
+
+/// Sums `CapacityInUse` by volume role for one container in the XML plist
+/// that `diskutil apfs list -plist` prints.
+fn container_usage(plist: &[u8], container: &str) -> Option<VolumeUsage> {
+    objc2::rc::autoreleasepool(|_| {
+        let data = NSData::with_bytes(plist);
+        let root = unsafe {
+            NSPropertyListSerialization::propertyListWithData_options_format_error(
+                &data,
+                NSPropertyListMutabilityOptions::Immutable,
+                std::ptr::null_mut(),
+            )
+        }
+        .ok()?;
+        let get = |dictionary: &PlistDictionary, key: &str| {
+            dictionary.objectForKey(&NSString::from_str(key))
+        };
+        let containers = get(instance_of::<PlistDictionary>(&root)?, "Containers")?;
+        let containers = instance_of::<PlistArray>(&containers)?;
+        let mut usage = VolumeUsage::default();
+        let mut found = false;
+        for entry in containers.iter() {
+            let Some(entry) = instance_of::<PlistDictionary>(&entry) else {
+                continue;
+            };
+            let reference = get(entry, "ContainerReference");
+            let is_root = reference
+                .as_deref()
+                .and_then(instance_of::<NSString>)
+                .is_some_and(|reference| reference.to_string() == container);
+            if !is_root {
+                continue;
+            }
+            found = true;
+            let volumes = get(entry, "Volumes")?;
+            for volume in instance_of::<PlistArray>(&volumes)?.iter() {
+                let Some(volume) = instance_of::<PlistDictionary>(&volume) else {
+                    continue;
+                };
+                let used = get(volume, "CapacityInUse")
+                    .as_deref()
+                    .and_then(instance_of::<NSNumber>)
+                    .map_or(0, |number| number.unsignedLongLongValue());
+                let roles: Vec<String> = get(volume, "Roles")
+                    .as_deref()
+                    .and_then(instance_of::<PlistArray>)
+                    .map(|roles| {
+                        roles
+                            .iter()
+                            .filter_map(|role| {
+                                instance_of::<NSString>(&role).map(|r| r.to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let slot = if roles.iter().any(|role| role == "Data") {
+                    &mut usage.data
+                } else if roles.iter().any(|role| role == "VM") {
+                    &mut usage.vm
+                } else {
+                    &mut usage.macos
+                };
+                *slot = slot.saturating_add(used);
+            }
+        }
+        found.then_some(usage)
+    })
+}
+
+/// "Available for important use" counts space macOS can purge; plain
+/// "available" does not. The difference is the purgeable space.
+fn purgeable_bytes() -> Option<u64> {
+    objc2::rc::autoreleasepool(|_| {
+        let url = NSURL::fileURLWithPath(&NSString::from_str("/System/Volumes/Data"));
+        let (important, plain) = unsafe {
+            (
+                NSURLVolumeAvailableCapacityForImportantUsageKey,
+                NSURLVolumeAvailableCapacityKey,
+            )
+        };
+        let values = url
+            .resourceValuesForKeys_error(&NSArray::from_slice(&[important, plain]))
+            .ok()?;
+        let number = |key: &NSString| {
+            values
+                .objectForKey(key)
+                .as_deref()
+                .and_then(instance_of::<NSNumber>)
+                .map(|number| number.longLongValue())
+        };
+        Some(number(important)?.saturating_sub(number(plain)?).max(0) as u64)
+    })
+}
+
+/// Sizes of the parts of the Data volume that a list does not already
+/// cover. Folders macOS does not let MacCleanUp read are None, never zero.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Breakdown {
+    /// Desktop, Documents, Downloads, Movies, Music, Public, and Pictures
+    /// without the Photos library (reading it raises a privacy prompt).
+    pub files: Size,
+    /// Xcode and simulator data, Rust and npm toolchains, and Homebrew.
+    pub developer: Size,
+    /// The folders measured for `developer`, so the caches list inside them
+    /// can be taken out and not counted twice.
+    pub developer_roots: Vec<PathBuf>,
+    pub backups: Option<Size>,
+    pub mail: Option<Size>,
+    pub trash: Option<Size>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Part {
+    Files,
+    Developer,
+    Backups,
+    Mail,
+}
+
+/// Measures the breakdown in one parallel walk.
+pub fn storage_breakdown(home: &Path, control: &Control) -> Breakdown {
+    let exists = |path: &PathBuf| std::fs::symlink_metadata(path).is_ok();
+    let readable = |path: &PathBuf| std::fs::read_dir(path).is_ok();
+    let mut parts: Vec<(Part, PathBuf)> = Vec::new();
+    for name in [
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Movies",
+        "Music",
+        "Public",
+    ] {
+        parts.push((Part::Files, home.join(name)));
+    }
+    if let Ok(pictures) = std::fs::read_dir(home.join("Pictures")) {
+        for entry in pictures.flatten() {
+            let path = entry.path();
+            let photos = path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("photoslibrary"));
+            if !photos {
+                parts.push((Part::Files, path));
+            }
+        }
+    }
+    let developer_roots: Vec<PathBuf> = [
+        home.join("Library/Developer"),
+        home.join(".cargo"),
+        home.join(".rustup"),
+        home.join(".npm"),
+        PathBuf::from("/opt/homebrew"),
+    ]
+    .into_iter()
+    .filter(exists)
+    .collect();
+    parts.extend(
+        developer_roots
+            .iter()
+            .map(|root| (Part::Developer, root.clone())),
+    );
+    let backups = home.join("Library/Application Support/MobileSync/Backup");
+    let has_backups = readable(&backups);
+    if has_backups {
+        parts.push((Part::Backups, backups));
+    }
+    let mail: Vec<PathBuf> = [home.join("Library/Mail"), home.join("Library/Messages")]
+        .into_iter()
+        .filter(readable)
+        .collect();
+    let has_mail = !mail.is_empty();
+    parts.extend(mail.into_iter().map(|path| (Part::Mail, path)));
+    parts.retain(|(_, path)| exists(path));
+
+    let paths: Vec<PathBuf> = parts.iter().map(|(_, path)| path.clone()).collect();
+    let sizes = measure_all(&paths, control).sizes;
+    let total = |wanted: Part| {
+        parts
+            .iter()
+            .zip(&sizes)
+            .filter(|((part, _), _)| *part == wanted)
+            .fold(
+                Size {
+                    bytes: 0,
+                    complete: true,
+                },
+                |sum, (_, size)| Size {
+                    bytes: sum.bytes.saturating_add(size.bytes),
+                    complete: sum.complete && size.complete,
+                },
+            )
+    };
+    Breakdown {
+        files: total(Part::Files),
+        developer: total(Part::Developer),
+        developer_roots,
+        backups: has_backups.then(|| total(Part::Backups)),
+        mail: has_mail.then(|| total(Part::Mail)),
+        trash: trash_size(&home.join(".Trash"), control),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -227,6 +498,62 @@ mod tests {
         assert!(disk.available <= disk.total);
         assert!(status.uptime_seconds.is_some());
         assert!(status.load_average.is_some());
+    }
+
+    #[test]
+    fn container_name_comes_from_the_startup_device() {
+        assert_eq!(container_of("/dev/disk3s1s1").as_deref(), Some("disk3"));
+        assert_eq!(container_of("/dev/disk12s5").as_deref(), Some("disk12"));
+        assert_eq!(container_of("map auto_home"), None);
+        assert_eq!(container_of("/dev/diskX"), None);
+    }
+
+    #[test]
+    fn volume_roles_are_summed_for_the_startup_container_only() {
+        let plist = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Containers</key><array>
+<dict><key>ContainerReference</key><string>disk1</string><key>Volumes</key><array>
+<dict><key>Roles</key><array><string>Preboot</string></array><key>CapacityInUse</key><integer>999</integer></dict>
+</array></dict>
+<dict><key>ContainerReference</key><string>disk3</string><key>Volumes</key><array>
+<dict><key>Roles</key><array><string>System</string></array><key>CapacityInUse</key><integer>100</integer></dict>
+<dict><key>Roles</key><array><string>Preboot</string></array><key>CapacityInUse</key><integer>20</integer></dict>
+<dict><key>Roles</key><array><string>Data</string></array><key>CapacityInUse</key><integer>5000</integer></dict>
+<dict><key>Roles</key><array><string>VM</string></array><key>CapacityInUse</key><integer>300</integer></dict>
+</array></dict>
+</array></dict></plist>"#;
+        let usage = container_usage(plist, "disk3").unwrap();
+        assert_eq!((usage.macos, usage.data, usage.vm), (120, 5000, 300));
+        assert_eq!(container_usage(plist, "disk9"), None);
+        assert_eq!(container_usage(b"not a plist", "disk3"), None);
+    }
+
+    #[test]
+    fn live_volume_usage_fits_inside_the_startup_disk() {
+        let usage = volume_usage().expect("diskutil reports the startup container");
+        let disk = collect().disk.unwrap();
+        assert!(usage.macos > 0 && usage.data > 0);
+        assert!(usage.macos + usage.data + usage.vm <= disk.total);
+        assert!(usage
+            .purgeable
+            .is_some_and(|purgeable| purgeable < disk.total));
+    }
+
+    #[test]
+    fn breakdown_measures_your_files_and_leaves_unreadable_parts_unavailable() {
+        let home = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/home");
+        let breakdown = storage_breakdown(&home, &Control::default());
+        let du = |path: &str| crate::scanner::tests::du_bytes(&home.join(path));
+        assert_eq!(
+            breakdown.files.bytes,
+            du("Desktop") + du("Documents") + du("Downloads")
+        );
+        assert!(breakdown.files.complete);
+        assert!(breakdown.developer_roots.contains(&home.join(".npm")));
+        assert!(breakdown.developer.bytes >= du(".npm"));
+        assert_eq!(breakdown.backups, None, "no backup folder in the fixture");
+        assert_eq!(breakdown.mail, None);
+        assert_eq!(breakdown.trash, None);
     }
 
     #[test]

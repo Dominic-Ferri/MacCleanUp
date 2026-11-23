@@ -9,7 +9,7 @@ use maccleanup::scanner::{
     scan_installers, scan_large_files, DiskScan, ScanResult, SizeCache, LARGE_FILE_AGE,
     LARGE_FILE_BYTES,
 };
-use maccleanup::system::{self, StorageExtras, SystemStatus};
+use maccleanup::system::{self, Breakdown, StorageExtras, SystemStatus, VolumeUsage};
 use maccleanup::trash::{related_app_data, trash_apps, trash_disk_item, trash_items};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -152,7 +152,13 @@ type ItemScan = fn(&Path, &Control) -> ScanResult<CleanItem>;
 enum WorkerMessage {
     Items(u64, Section, ScanResult<CleanItem>),
     Applications(u64, ScanResult<AppItem>),
-    Overview(u64, ScanResult<CleanItem>, ScanResult<AppItem>),
+    Overview(
+        u64,
+        ScanResult<CleanItem>,
+        ScanResult<AppItem>,
+        Option<VolumeUsage>,
+    ),
+    Breakdown(u64, Option<VolumeUsage>, Breakdown),
     Disk(u64, PathBuf, DiskScan),
     Storage(u64, StorageExtras),
     Operation(u64, Section, Vec<(String, u64)>, OperationResult),
@@ -178,6 +184,11 @@ pub struct State {
     pub filter: [String; Section::COUNT],
     pub status: Option<SystemStatus>,
     pub extras: Option<StorageExtras>,
+    /// Per-volume use of the startup disk, read with the Overview scan.
+    pub volumes: Option<VolumeUsage>,
+    /// The Data volume split into your files, developer tools, backups and
+    /// more, after the person asks for it.
+    pub breakdown: Option<Breakdown>,
     pub message: String,
     pub busy: Option<Busy>,
     pub confirmation: Option<Confirmation>,
@@ -231,6 +242,8 @@ impl State {
             filter: Default::default(),
             status: None,
             extras: None,
+            volumes: None,
+            breakdown: None,
             message: "Nothing moves until you review it.".to_string(),
             busy: None,
             confirmation: None,
@@ -417,7 +430,8 @@ impl State {
         }
     }
 
-    /// Scans caches and apps at the same time.
+    /// Scans caches and apps at the same time, and reads how the startup
+    /// disk's volumes are used.
     fn scan_overview(&mut self) {
         let home = self.home.clone();
         self.loaded[Section::Clean.index()] = true;
@@ -426,12 +440,39 @@ impl State {
             "Scanning caches and apps",
             vec![Section::Clean, Section::Applications],
             move |generation, cancel| {
-                let (clean, apps) = std::thread::scope(|scope| {
+                let (clean, apps, volumes) = std::thread::scope(|scope| {
                     let apps = scope.spawn(|| scan_apps(&home, cancel));
+                    let volumes = scope.spawn(system::volume_usage);
                     let clean = scan_cleanup(&home, cancel);
-                    (clean, apps.join().unwrap_or_default())
+                    (
+                        clean,
+                        apps.join().unwrap_or_default(),
+                        volumes.join().ok().flatten(),
+                    )
                 });
-                WorkerMessage::Overview(generation, clean, apps)
+                WorkerMessage::Overview(generation, clean, apps, volumes)
+            },
+        );
+    }
+
+    /// Measures your files, developer tools, backups, Mail and Messages,
+    /// and the Trash, so the storage bar can name more of the used space.
+    /// Reads Desktop, Documents and Downloads, so it waits for a click.
+    pub fn measure_storage(&mut self) {
+        if !self.can_start() {
+            return;
+        }
+        let home = self.home.clone();
+        self.spawn(
+            "Measuring storage",
+            vec![Section::Overview],
+            move |generation, control| {
+                let volumes = system::volume_usage();
+                WorkerMessage::Breakdown(
+                    generation,
+                    volumes,
+                    system::storage_breakdown(&home, control),
+                )
             },
         );
     }
@@ -539,6 +580,7 @@ impl State {
                 WorkerMessage::Items(generation, ..)
                 | WorkerMessage::Applications(generation, _)
                 | WorkerMessage::Overview(generation, ..)
+                | WorkerMessage::Breakdown(generation, ..)
                 | WorkerMessage::Disk(generation, ..)
                 | WorkerMessage::Storage(generation, _)
                 | WorkerMessage::Operation(generation, ..) => *generation,
@@ -558,12 +600,18 @@ impl State {
                     self.finish_scan(section, count, result.errors)
                 }
                 WorkerMessage::Applications(_, result) => self.finish_apps(result),
-                WorkerMessage::Overview(_, clean, apps) => {
+                WorkerMessage::Overview(_, clean, apps, volumes) => {
                     let count = clean.items.len();
                     self.clean_items = clean.items;
                     let clean = self.finish_scan(Section::Clean, count, clean.errors);
                     let apps = self.finish_apps(apps);
+                    self.volumes = volumes.or(self.volumes);
                     format!("Caches: {clean} Apps: {apps}")
+                }
+                WorkerMessage::Breakdown(_, volumes, breakdown) => {
+                    self.volumes = volumes.or(self.volumes);
+                    self.breakdown = Some(breakdown);
+                    "Storage measured.".to_string()
                 }
                 WorkerMessage::Disk(_, root, result) => self.finish_disk(&root, result),
                 WorkerMessage::Storage(_, extras) => {
@@ -692,6 +740,10 @@ impl State {
             },
         );
         self.invalidate(&result.moved_paths);
+        if result.moved > 0 {
+            // Moved items changed the totals, so measure again before showing them.
+            self.breakdown = None;
+        }
         self.message = summary.clone();
         if section == Section::Disk {
             // Only the moved item changed, so drop it instead of measuring

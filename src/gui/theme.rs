@@ -19,13 +19,17 @@ pub const FLARE: Color32 = Color32::from_rgb(0xE8, 0x65, 0x6F);
 
 /// Mineral tones for storage strata and treemap tiles. Muted so the headlamp
 /// outline of the selected tile stays the brightest thing on screen.
-pub const STRATA: [Color32; 6] = [
+pub const STRATA: [Color32; 10] = [
     Color32::from_rgb(0x4F, 0x7A, 0x8C),
     Color32::from_rgb(0x7E, 0x6A, 0x96),
     Color32::from_rgb(0x67, 0x86, 0x58),
     Color32::from_rgb(0x9C, 0x7B, 0x4C),
     Color32::from_rgb(0x58, 0x68, 0x96),
     Color32::from_rgb(0x88, 0x5E, 0x5E),
+    Color32::from_rgb(0x4E, 0x86, 0x7C),
+    Color32::from_rgb(0x96, 0x6A, 0x84),
+    Color32::from_rgb(0x6E, 0x78, 0x86),
+    Color32::from_rgb(0x8E, 0x86, 0x5A),
 ];
 
 pub fn condensed(size: f32) -> FontId {

@@ -1,6 +1,6 @@
 # MacCleanUp
 
-MacCleanUp is a standalone macOS cleanup app with a native window interface written in Rust (eframe/egui). It covers the everyday Clean, Uninstall, Installer, Analyze, and Status workflows of Mole. It does not run Mole, shell cleanup scripts, Homebrew, or privileged commands. The only other programs it starts are `tmutil listlocalsnapshots /`, which reads the snapshot list for the System view, `open -R` for Show in Finder, and `osascript` when Finder must move an item for it (see Safety model).
+MacCleanUp is a standalone macOS cleanup app with a native window interface written in Rust (eframe/egui). It covers the everyday Clean, Uninstall, Installer, Analyze, and Status workflows of Mole. It does not run Mole, shell cleanup scripts, Homebrew, or privileged commands. The only other programs it starts are `tmutil listlocalsnapshots /`, which reads the snapshot list for the System view, `diskutil apfs list -plist`, which reads how the startup disk's volumes are used, `open -R` for Show in Finder, and `osascript` when Finder must move an item for it (see Safety model).
 
 ## Run
 
@@ -17,7 +17,7 @@ Open `MacCleanUp.app`.
 
 A sidebar lists the views. Lists show a details panel on the right: where the item lives, its size, when it last changed, what it is, and what happens when it moves to Trash. The status bar shows the last result and any running scan, with a Stop button.
 
-- **Overview:** free space on the startup disk, and a storage bar split into Applications, Caches and logs, Installer files (once scanned), everything else in use, and free space. Below it, each cleanup area with its total and a button to review it.
+- **Overview:** free space on the startup disk, and a storage bar. When the app opens, the bar shows macOS (the System, Preboot, Recovery and Update volumes), Applications, Caches and logs, Swap and sleep image (the VM volume), and Purgeable space (Time Machine local snapshots and other space macOS frees by itself). **Measure your files and more** adds Your files (Desktop, Documents, Downloads, Movies, Music, Public, and Pictures without the Photos library), Developer tools (`~/Library/Developer`, `.cargo`, `.rustup`, `.npm`, and Homebrew, without the caches already listed), iPhone and iPad backups, Mail and Messages, and the Trash. What is left is System Data and other files. A part that macOS does not let MacCleanUp read is left out and named under the bar; Full Disk Access includes it. Below the bar, each cleanup area has its total and a button to review it.
 - **Caches and logs:** user caches, logs, temporary files, Xcode DerivedData, Xcode device support files (iOS, watchOS, tvOS, and visionOS), CoreSimulator caches, and the npm download cache. Every item starts unselected.
 - **Applications:** apps in `/Applications` and `~/Applications`, including one nested level, with version, bundle ID, size, and last change. The details panel lists exactly what uninstall moves: the app plus its exact bundle-ID cache and log folders. A checkbox, off for every app, also moves the app's settings and data named after its exact bundle ID in `~/Library`: `Application Support/<id>`, `Preferences/<id>.plist`, `Saved Application State/<id>.savedState`, `HTTPStorages/<id>`, and `WebKit/<id>`. The details panel lists each of these paths before you tick the box. Documents, containers, group containers, and folders with any other name always stay. Most browsers keep their profiles under another name, so those stay too; Opera keeps its profile in `Application Support/com.operasoftware.Opera`, so for Opera the option moves it. Containers are left out because macOS asks for permission before another app's container can be read or moved.
 - **Installer files:** `.dmg`, `.pkg`, `.mpkg`, `.iso`, and `.xip` files, plus `.pkg` and `.mpkg` bundle folders, in `~/Downloads`, `~/Desktop`, `~/Documents`, `~/Public`, `~/Library/Downloads`, and iCloud Drive's Downloads folder, directly or one folder below. ZIP archives are not inspected.
@@ -33,7 +33,7 @@ Scans measure folders on all processor cores. A progress bar in the status bar, 
 
 Lists can be filtered by name and sorted by name, size, or last change.
 
-Version 0.4.2 does not implement Mole's Optimize, Purge, Slim, Touch ID, update, or administrator-only workflows.
+Version 0.4.3 does not implement Mole's Optimize, Purge, Slim, Touch ID, update, or administrator-only workflows.
 
 ## Keyboard
 
