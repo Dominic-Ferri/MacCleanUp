@@ -31,9 +31,11 @@
 
 ## Install
 
-MacCleanUp has no installer. Build it from source with Rust, then open `build/<version>/MacCleanUp.app`:
+MacCleanUp has no installer. Build it from source, then open `build/<version>/MacCleanUp.app`. The build needs Rust 1.85 or later (from [rustup](https://rustup.rs)), the Apple Silicon and Intel targets, and the Xcode Command Line Tools for `lipo` and `codesign`:
 
 ```sh
+xcode-select --install
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
 git clone https://github.com/dominicferri/MacCleanUp.git
 cd MacCleanUp
 ./scripts/build-app.sh

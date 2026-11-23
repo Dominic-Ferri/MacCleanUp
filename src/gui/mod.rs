@@ -2360,6 +2360,9 @@ mod tests {
         let Some(folder) = std::env::var_os("MACCLEANUP_SHOTS") else {
             return;
         };
+        // Without this the last click leaves a pointer and a hover highlight.
+        harness.remove_cursor();
+        harness.run_steps(2);
         let image = harness.render().expect("render frame");
         image
             .save(PathBuf::from(folder).join(format!("{name}.png")))
