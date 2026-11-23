@@ -468,6 +468,10 @@ impl MacCleanUp {
             });
         });
         ui.add_space(10.0);
+        if self.state.is_scanning(section) {
+            scan_bar(ui, self.state.progress, ui.available_width());
+            ui.add_space(10.0);
+        }
 
         if !loaded {
             empty_state(
@@ -708,6 +712,10 @@ impl MacCleanUp {
                 "This folder is empty, or it could not be read."
             };
             empty_state(ui, "No items to show", text);
+            if self.state.is_scanning(Section::Disk) {
+                ui.add_space(12.0);
+                scan_bar(ui, self.state.progress, ui.available_width().min(520.0));
+            }
             return;
         }
 
@@ -1257,12 +1265,17 @@ impl MacCleanUp {
                     {
                         self.state.cancel_scan();
                     }
+                    if !busy.mutating {
+                        scan_bar(ui, self.state.progress, 200.0);
+                    }
                     ui.label(RichText::new(&busy.label).color(if busy.mutating {
                         ORE
                     } else {
                         HEADLAMP
                     }));
-                    ui.add(egui::Spinner::new().size(14.0).color(HEADLAMP));
+                    if busy.mutating {
+                        ui.add(egui::Spinner::new().size(14.0).color(HEADLAMP));
+                    }
                 }
             });
         });
@@ -1683,6 +1696,37 @@ fn fact(ui: &mut Ui, label: &str, value: &str) {
     ui.add_space(6.0);
 }
 
+/// A scan's progress: the share of items finished, and how many files and
+/// folders it has read. Before the scan knows its total, the bar animates.
+fn scan_bar(ui: &mut Ui, progress: state::ScanProgress, width: f32) {
+    let checked = format!("{} checked", grouped(progress.checked));
+    let text = match progress.fraction {
+        Some(fraction) => format!("{:.0}%   {checked}", fraction * 100.0),
+        None if progress.checked == 0 => "Starting…".to_string(),
+        None => checked,
+    };
+    ui.add(
+        egui::ProgressBar::new(progress.fraction.unwrap_or(0.0))
+            .desired_width(width)
+            .fill(HEADLAMP.gamma_multiply(0.55))
+            .animate(progress.fraction.is_none())
+            .text(RichText::new(text).small().color(CHALK)),
+    );
+}
+
+/// 1234567 becomes "1,234,567".
+fn grouped(count: u64) -> String {
+    let digits = count.to_string();
+    let mut text = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            text.push(',');
+        }
+        text.push(digit);
+    }
+    text
+}
+
 fn size_text(bytes: u64, complete: bool) -> String {
     if complete {
         format_bytes(bytes)
@@ -1968,6 +2012,37 @@ mod tests {
     }
 
     #[test]
+    fn a_running_scan_shows_a_progress_bar_with_its_share_and_count() {
+        let mut harness = harness(fixture_home());
+        settle(&mut harness);
+        nav(&mut harness, "Installer files");
+        {
+            let state = &mut harness.state_mut().state;
+            state.busy = Some(state::Busy {
+                label: "Looking for installer files".to_string(),
+                mutating: false,
+                sections: vec![Section::Installers],
+            });
+            state.progress = state::ScanProgress {
+                fraction: Some(0.42),
+                checked: 123_456,
+            };
+        }
+        harness.run_steps(3);
+        shot(&mut harness, "progress");
+        // One bar above the list, one in the status bar.
+        assert_eq!(
+            harness.query_all_by_label("42%   123,456 checked").count(),
+            2
+        );
+        shot(&mut harness, "progress");
+        harness.state_mut().state.progress = state::ScanProgress::default();
+        harness.run_steps(2);
+        assert!(harness.query_all_by_label("Starting…").count() >= 1);
+        harness.state_mut().state.busy = None;
+    }
+
+    #[test]
     fn search_sections_wait_for_a_scan_then_list_results() {
         let mut harness = harness(fixture_home());
         settle(&mut harness);
@@ -2076,5 +2151,9 @@ mod tests {
         assert_eq!(percent(0, 0), "0%");
         assert_eq!(elide("abcdefghij", 40.0, 8.0), "abcd…");
         assert_eq!(duration(90_061), "1d 1h");
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(1_000), "1,000");
+        assert_eq!(grouped(1_234_567), "1,234,567");
     }
 }

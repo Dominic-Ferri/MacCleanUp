@@ -1,6 +1,7 @@
 //! Application state and background jobs, independent of drawing.
 
 use maccleanup::model::{format_bytes, AppItem, CleanItem, DiskItem, OperationResult};
+use maccleanup::scanner::Control;
 #[cfg(test)]
 use maccleanup::scanner::Size;
 use maccleanup::scanner::{
@@ -12,7 +13,6 @@ use maccleanup::system::{self, StorageExtras, SystemStatus};
 use maccleanup::trash::{related_app_data, trash_apps, trash_disk_item, trash_items};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -146,7 +146,7 @@ pub struct ActivityEntry {
     pub failed: bool,
 }
 
-type ItemScan = fn(&Path, &AtomicBool) -> ScanResult<CleanItem>;
+type ItemScan = fn(&Path, &Control) -> ScanResult<CleanItem>;
 
 #[derive(Debug)]
 enum WorkerMessage {
@@ -195,8 +195,20 @@ pub struct State {
     sender: Sender<WorkerMessage>,
     receiver: Receiver<WorkerMessage>,
     generation: u64,
-    cancel: Arc<AtomicBool>,
+    /// The running job's stop flag and progress counts.
+    control: Arc<Control>,
+    /// The running scan's progress, refreshed every frame. It never moves
+    /// backward, even when a later phase adds items to measure.
+    pub progress: ScanProgress,
     waker: Option<Waker>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScanProgress {
+    /// 0.0 to 1.0, or None before the scan knows how much it has to do.
+    pub fraction: Option<f32>,
+    /// Files and folders read so far.
+    pub checked: u64,
 }
 
 impl State {
@@ -233,7 +245,8 @@ impl State {
             sender,
             receiver,
             generation: 0,
-            cancel: Arc::default(),
+            control: Arc::default(),
+            progress: ScanProgress::default(),
             waker: None,
         }
     }
@@ -289,6 +302,16 @@ impl State {
     /// keeps system metrics fresh. Returns how soon it wants another frame.
     pub fn update(&mut self) -> Option<Duration> {
         self.poll_worker();
+        let now = self.control.progress();
+        // Until the job reports a count, keep what is shown.
+        if self.busy.as_ref().is_some_and(|busy| !busy.mutating) && now != Default::default() {
+            self.progress = ScanProgress {
+                fraction: now
+                    .fraction()
+                    .map(|fraction| fraction.max(self.progress.fraction.unwrap_or(0.0))),
+                checked: now.checked,
+            };
+        }
         let wants_status = matches!(self.section, Section::Status | Section::Overview);
         if wants_status
             && self
@@ -327,6 +350,13 @@ impl State {
 
     pub fn can_start(&self) -> bool {
         self.busy.is_none()
+    }
+
+    /// True while a scan that loads `section` runs.
+    pub fn is_scanning(&self, section: Section) -> bool {
+        self.busy
+            .as_ref()
+            .is_some_and(|busy| !busy.mutating && busy.sections.contains(&section))
     }
 
     /// Starts the scan for `section` at the person's request. Ignored while
@@ -454,7 +484,7 @@ impl State {
         };
         // The walk stops at its next folder; its result carries the old
         // generation and is discarded.
-        self.cancel.store(true, Ordering::Relaxed);
+        self.control.stop();
         for section in busy.sections.clone() {
             self.loaded[section.index()] = false;
             self.stopped[section.index()] = true;
@@ -474,28 +504,29 @@ impl State {
 
     fn spawn<F>(&mut self, label: impl Into<String>, sections: Vec<Section>, work: F)
     where
-        F: FnOnce(u64, &AtomicBool) -> WorkerMessage + Send + 'static,
+        F: FnOnce(u64, &Control) -> WorkerMessage + Send + 'static,
     {
         self.start_job(label.into(), false, sections, work);
     }
 
     fn start_job<F>(&mut self, label: String, mutating: bool, sections: Vec<Section>, work: F)
     where
-        F: FnOnce(u64, &AtomicBool) -> WorkerMessage + Send + 'static,
+        F: FnOnce(u64, &Control) -> WorkerMessage + Send + 'static,
     {
         self.generation += 1;
         let generation = self.generation;
         let sender = self.sender.clone();
         let waker = self.waker.clone();
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.cancel = Arc::clone(&cancel);
+        let control = Arc::new(Control::default());
+        self.control = Arc::clone(&control);
+        self.progress = ScanProgress::default();
         self.busy = Some(Busy {
             label,
             mutating,
             sections,
         });
         std::thread::spawn(move || {
-            let _ = sender.send(work(generation, &cancel));
+            let _ = sender.send(work(generation, &control));
             if let Some(waker) = waker {
                 waker();
             }
@@ -516,6 +547,8 @@ impl State {
                 continue;
             }
             self.busy = None;
+            // The finished job's counts must not show under the next one.
+            self.control = Arc::default();
             let message = match message {
                 WorkerMessage::Items(_, section, result) => {
                     let count = result.items.len();
@@ -1007,9 +1040,9 @@ mod tests {
     fn a_stopped_scan_stays_stopped_until_the_person_scans_again() {
         let mut state = State::new(fixture_home());
         state.update();
-        let cancel = Arc::clone(&state.cancel);
+        let control = Arc::clone(&state.control);
         state.cancel_scan();
-        assert!(cancel.load(Ordering::Relaxed), "the walk is told to stop");
+        assert!(control.is_stopped(), "the walk is told to stop");
         assert!(!state.is_loaded(Section::Clean));
         assert!(!state.is_loaded(Section::Applications));
         assert!(state.is_stopped(Section::Clean));
@@ -1019,6 +1052,29 @@ mod tests {
         assert!(!state.is_stopped(Section::Clean));
         wait_idle(&mut state);
         assert!(state.is_loaded(Section::Clean));
+    }
+
+    #[test]
+    fn progress_resets_per_scan_and_never_moves_backward() {
+        let mut state = State::new(fixture_home());
+        state.progress.fraction = Some(0.9);
+        state.scan(Section::Installers);
+        assert_eq!(
+            state.progress,
+            ScanProgress::default(),
+            "a new scan starts at zero"
+        );
+        assert!(state.is_scanning(Section::Installers));
+        assert!(!state.is_scanning(Section::Clean));
+        let mut seen = Vec::new();
+        while state.busy.is_some() {
+            state.update();
+            seen.extend(state.progress.fraction);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(seen.windows(2).all(|pair| pair[0] <= pair[1]), "{seen:?}");
+        assert!(seen.iter().all(|fraction| (0.0..=1.0).contains(fraction)));
+        assert!(!state.is_scanning(Section::Installers));
     }
 
     #[test]

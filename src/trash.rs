@@ -189,14 +189,54 @@ fn move_one(path: &Path, bytes: u64, result: &mut OperationResult) -> bool {
     }
 }
 
+/// `NSFileWriteNoPermissionError`: macOS refused this app the move.
+const NO_PERMISSION: isize = 513;
+
 fn trash_path(path: &Path) -> Result<(), String> {
-    objc2::rc::autoreleasepool(|_| {
+    let direct = objc2::rc::autoreleasepool(|_| {
         let path_string = NSString::from_str(&path.to_string_lossy());
         let url = NSURL::fileURLWithPath(&path_string);
         let manager = NSFileManager::defaultManager();
         manager
             .trashItemAtURL_resultingItemURL_error(&url, None)
-            .map_err(|error| error.localizedDescription().to_string())
+            .map_err(|error| (error.code(), error.localizedDescription().to_string()))
+    });
+    match direct {
+        Ok(()) => Ok(()),
+        Err((NO_PERMISSION, message)) => trash_with_finder(path)
+            .map_err(|finder| format!("{message} Finder could not move it either: {finder}")),
+        Err((_, message)) => Err(message),
+    }
+}
+
+/// Finder can move some items that macOS refuses MacCleanUp, such as files
+/// in a folder that cloud sync manages, and it may ask for an administrator
+/// password for items you do not own. Put Back still works. The path is an
+/// argument to the script, never part of its text. macOS asks once whether
+/// MacCleanUp may control Finder.
+fn trash_with_finder(path: &Path) -> Result<(), String> {
+    let output = std::process::Command::new("/usr/bin/osascript")
+        .args([
+            "-e",
+            "on run argv",
+            "-e",
+            "set target to POSIX file (item 1 of argv) as alias",
+            "-e",
+            "tell application \"Finder\" to delete target",
+            "-e",
+            "end run",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() && fs::symlink_metadata(path).is_err() {
+        return Ok(());
+    }
+    let reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if reason.is_empty() {
+        "the item is still in place".to_string()
+    } else {
+        reason
     })
 }
 

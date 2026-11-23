@@ -1,6 +1,6 @@
 # MacCleanUp
 
-MacCleanUp is a standalone macOS cleanup app with a native window interface written in Rust (eframe/egui). It covers the everyday Clean, Uninstall, Installer, Analyze, and Status workflows of Mole. It does not run Mole, shell cleanup scripts, Homebrew, or privileged commands. The only other programs it starts are `tmutil listlocalsnapshots /`, which reads the snapshot list for the System view, and `open -R` for Show in Finder.
+MacCleanUp is a standalone macOS cleanup app with a native window interface written in Rust (eframe/egui). It covers the everyday Clean, Uninstall, Installer, Analyze, and Status workflows of Mole. It does not run Mole, shell cleanup scripts, Homebrew, or privileged commands. The only other programs it starts are `tmutil listlocalsnapshots /`, which reads the snapshot list for the System view, `open -R` for Show in Finder, and `osascript` when Finder must move an item for it (see Safety model).
 
 ## Run
 
@@ -29,11 +29,11 @@ A sidebar lists the views. Lists show a details panel on the right: where the it
 
 Caches and Applications scan together when the app opens. Installer files, Large old files, Build folders, and Disk map wait for a click, because they read Desktop, Documents, and Downloads, and macOS may ask MacCleanUp for access to those folders the first time. The two searches do not open `~/Library`, the Trash, app bundles, or Photos libraries, and do not cross onto other volumes.
 
-Scans measure folders on all processor cores. **Stop** (or `Esc`) ends the scan within a moment. A stopped view stays unscanned until you scan it again.
+Scans measure folders on all processor cores. A progress bar in the status bar, and above the list or disk map being scanned, shows the share of items finished and how many files and folders have been read. **Stop** (or `Esc`) ends the scan within a moment. A stopped view stays unscanned until you scan it again.
 
 Lists can be filtered by name and sorted by name, size, or last change.
 
-Version 0.4.0 does not implement Mole's Optimize, Purge, Slim, Touch ID, update, or administrator-only workflows.
+Version 0.4.1 does not implement Mole's Optimize, Purge, Slim, Touch ID, update, or administrator-only workflows.
 
 ## Keyboard
 
@@ -58,6 +58,7 @@ The review dialog lists every path that will move and its size. `Return` and `Es
 - Directory sizing does not follow symlinks or cross mounted filesystems. Partial sizes, including app sizes, are shown in amber; unavailable bytes are not presented as a known-empty directory. One unreadable item in a Disk map folder is skipped and listed; it does not hide the rest of the folder.
 - App caches and data are not removed if the app move fails or another unselected installed copy uses the same bundle ID. The uninstall preview and the operation use the same function, so they cannot disagree.
 - Trash failures are reported item by item.
+- When macOS answers that MacCleanUp has no permission to move an item, MacCleanUp asks Finder to move that one item to the Trash. This can happen in a Documents or Desktop folder that cloud sync manages. Finder may ask for an administrator password when the item belongs to another user. Put Back still works. The path goes to the script as an argument, not as script text. The first time, macOS asks whether MacCleanUp may control Finder. MacCleanUp never runs itself as root: a move made as root would go to root's Trash, where Put Back does not work.
 - MacCleanUp does not terminate running apps. Close an app before removing its caches or uninstalling it.
 - Sizes are space used on disk (allocated blocks), and a file with several hard links counts once per measured item, as `du` reports. Sparse files count only the blocks they use. APFS clones that share blocks can still be counted more than once.
 

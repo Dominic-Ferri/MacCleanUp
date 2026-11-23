@@ -44,7 +44,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key><string>MacCleanUp</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
-    <key>CFBundleVersion</key><string>4</string>
+    <key>CFBundleVersion</key><string>5</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>NSHighResolutionCapable</key><true/>
@@ -52,6 +52,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>NSDesktopFolderUsageDescription</key><string>MacCleanUp looks for leftover installer files and measures folder sizes on your Desktop. It moves nothing without your review.</string>
     <key>NSDocumentsFolderUsageDescription</key><string>MacCleanUp looks for leftover installer files and measures folder sizes in Documents. It moves nothing without your review.</string>
     <key>NSDownloadsFolderUsageDescription</key><string>MacCleanUp looks for leftover installer files and measures folder sizes in Downloads. It moves nothing without your review.</string>
+    <key>NSAppleEventsUsageDescription</key><string>When macOS does not let MacCleanUp move an item you reviewed, MacCleanUp asks Finder to move it to the Trash instead. Put Back still works.</string>
 </dict>
 </plist>
 PLIST

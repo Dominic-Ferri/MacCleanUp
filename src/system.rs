@@ -1,9 +1,9 @@
+use crate::scanner::Control;
 use crate::scanner::{measure_all, Size};
 use objc2_foundation::NSProcessInfo;
 use std::ffi::CString;
 use std::mem::{size_of, MaybeUninit};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Read-only storage figures that take longer than the 2-second metrics.
@@ -16,20 +16,20 @@ pub struct StorageExtras {
     pub snapshots: Option<usize>,
 }
 
-pub fn storage_extras(home: &Path, cancel: &AtomicBool) -> StorageExtras {
+pub fn storage_extras(home: &Path, control: &Control) -> StorageExtras {
     StorageExtras {
-        trash: trash_size(&home.join(".Trash"), cancel),
+        trash: trash_size(&home.join(".Trash"), control),
         snapshots: local_snapshots(),
     }
 }
 
-fn trash_size(trash: &Path, cancel: &AtomicBool) -> Option<Size> {
+fn trash_size(trash: &Path, control: &Control) -> Option<Size> {
     let children: Vec<PathBuf> = std::fs::read_dir(trash)
         .ok()?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<Result<_, _>>()
         .ok()?;
-    let sizes = measure_all(&children, cancel).sizes;
+    let sizes = measure_all(&children, control).sizes;
     Some(Size {
         bytes: sizes.iter().map(|size| size.bytes).sum(),
         complete: sizes.iter().all(|size| size.complete),
@@ -239,9 +239,9 @@ mod tests {
     #[test]
     fn unreadable_or_missing_trash_is_unavailable_not_empty() {
         let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/home/.Trash");
-        assert_eq!(trash_size(&missing, &AtomicBool::new(false)), None);
+        assert_eq!(trash_size(&missing, &Control::default()), None);
         let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/home/Library/Logs");
-        let size = trash_size(&folder, &AtomicBool::new(false)).unwrap();
+        let size = trash_size(&folder, &Control::default()).unwrap();
         assert!(size.complete && size.bytes > 0);
     }
 }

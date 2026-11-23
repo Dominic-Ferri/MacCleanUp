@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
@@ -59,6 +59,60 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Shared by a scan and the window: a stop flag the walk checks, and counts
+/// the window turns into a progress bar.
+#[derive(Debug, Default)]
+pub struct Control {
+    stopped: AtomicBool,
+    checked: AtomicU64,
+    done: AtomicUsize,
+    total: AtomicUsize,
+}
+
+/// A snapshot of a scan's progress. `total` grows as each phase starts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Progress {
+    /// Top-level items fully measured or searched.
+    pub done: usize,
+    /// Top-level items started.
+    pub total: usize,
+    /// Files and folders read so far.
+    pub checked: u64,
+}
+
+impl Progress {
+    /// Share of the started items that are finished, when any have started.
+    pub fn fraction(self) -> Option<f32> {
+        (self.total > 0).then(|| (self.done as f32 / self.total as f32).min(1.0))
+    }
+}
+
+impl Control {
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    pub fn progress(&self) -> Progress {
+        Progress {
+            done: self.done.load(Ordering::Relaxed),
+            total: self.total.load(Ordering::Relaxed),
+            checked: self.checked.load(Ordering::Relaxed),
+        }
+    }
+
+    fn started(&self, items: usize) {
+        self.total.fetch_add(items, Ordering::Relaxed);
+    }
+
+    fn finished(&self, items: usize) {
+        self.done.fetch_add(items, Ordering::Relaxed);
+    }
+}
+
 // Parallel walk -------------------------------------------------------------
 
 /// What the walker does with one directory entry.
@@ -83,18 +137,25 @@ struct Queue {
     jobs: Vec<usize>,
     nodes: Vec<Node>,
     active: usize,
+    /// Folders still to read per root; a root is finished when it reaches 0.
+    pending: Vec<usize>,
 }
 
 /// Reads every directory below `starts` on all cores. `visit` sees each entry
 /// once, with `lstat` metadata, and decides whether to descend. Returns one
 /// node per directory read, with subtree totals; the first `starts.len()`
-/// nodes are the starts themselves. A set `cancel` flag stops the walk and
-/// marks the unfinished nodes incomplete.
+/// nodes are the starts themselves. Each start that finishes counts as done
+/// in `control`. A stopped `control` ends the walk and marks the unfinished
+/// nodes incomplete.
 fn walk(
     starts: Vec<(usize, PathBuf)>,
-    cancel: &AtomicBool,
+    control: &Control,
     visit: &(dyn Fn(usize, &Path, &fs::Metadata) -> Visit + Sync),
 ) -> Vec<Node> {
+    let mut pending = vec![0; starts.iter().map(|(root, _)| root + 1).max().unwrap_or(0)];
+    for (root, _) in &starts {
+        pending[*root] += 1;
+    }
     let nodes: Vec<Node> = starts
         .into_iter()
         .map(|(root, path)| Node {
@@ -110,6 +171,7 @@ fn walk(
         jobs: (0..nodes.len()).rev().collect(),
         nodes,
         active: 0,
+        pending,
     });
     let ready = Condvar::new();
     let threads = std::thread::available_parallelism()
@@ -117,14 +179,14 @@ fn walk(
         .min(16);
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            scope.spawn(|| worker(&queue, &ready, cancel, visit));
+            scope.spawn(|| worker(&queue, &ready, control, visit));
         }
     });
     let mut nodes = queue
         .into_inner()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .nodes;
-    if cancel.load(Ordering::Relaxed) {
+    if control.is_stopped() {
         for node in &mut nodes {
             node.complete = false;
         }
@@ -136,14 +198,14 @@ fn walk(
 fn worker(
     queue: &Mutex<Queue>,
     ready: &Condvar,
-    cancel: &AtomicBool,
+    control: &Control,
     visit: &(dyn Fn(usize, &Path, &fs::Metadata) -> Visit + Sync),
 ) {
     loop {
         let (id, root, directory) = {
             let mut state = lock(queue);
             loop {
-                if cancel.load(Ordering::Relaxed) {
+                if control.is_stopped() {
                     state.jobs.clear();
                 }
                 if let Some(id) = state.jobs.pop() {
@@ -167,7 +229,7 @@ fn worker(
         match fs::read_dir(&directory) {
             Ok(listing) => {
                 for entry in listing {
-                    if cancel.load(Ordering::Relaxed) {
+                    if control.is_stopped() {
                         complete = false;
                         break;
                     }
@@ -189,11 +251,16 @@ fn worker(
             }
             Err(_) => complete = false,
         }
+        control.checked.fetch_add(entries, Ordering::Relaxed);
         let mut state = lock(queue);
         let node = &mut state.nodes[id];
         node.bytes = bytes;
         node.entries = entries;
         node.complete = complete;
+        state.pending[root] = state.pending[root] + children.len() - 1;
+        if state.pending[root] == 0 {
+            control.finished(1);
+        }
         for path in children {
             let child = state.nodes.len();
             state.nodes.push(Node {
@@ -238,12 +305,14 @@ pub struct Measured {
 /// Measures every path at once on all cores. Symlinks count as themselves,
 /// other volumes are not entered, and a file with several hard links counts
 /// once per measured path.
-pub fn measure_all(paths: &[PathBuf], cancel: &AtomicBool) -> Measured {
+pub fn measure_all(paths: &[PathBuf], control: &Control) -> Measured {
+    control.started(paths.len());
     let mut sizes = vec![Size::default(); paths.len()];
     let mut devices = vec![0_u64; paths.len()];
     let mut starts = Vec::new();
     for (index, path) in paths.iter().enumerate() {
         let Ok(metadata) = fs::symlink_metadata(path) else {
+            control.finished(1);
             continue;
         };
         sizes[index] = Size {
@@ -253,6 +322,8 @@ pub fn measure_all(paths: &[PathBuf], cancel: &AtomicBool) -> Measured {
         if metadata.is_dir() {
             devices[index] = metadata.dev();
             starts.push((index, path.clone()));
+        } else {
+            control.finished(1);
         }
     }
     let links = Mutex::new(HashSet::new());
@@ -275,8 +346,8 @@ pub fn measure_all(paths: &[PathBuf], cancel: &AtomicBool) -> Measured {
             complete: !is_dir || same_volume,
         }
     };
-    let nodes = walk(starts, cancel, &visit);
-    let stopped = cancel.load(Ordering::Relaxed);
+    let nodes = walk(starts, control, &visit);
+    let stopped = control.is_stopped();
     for node in nodes.iter().filter(|node| node.parent.is_none()) {
         let size = &mut sizes[node.root];
         size.bytes = size.bytes.saturating_add(node.bytes);
@@ -343,7 +414,7 @@ pub fn cleanup_roots(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn scan_cleanup(home: &Path, cancel: &AtomicBool) -> ScanResult<CleanItem> {
+pub fn scan_cleanup(home: &Path, control: &Control) -> ScanResult<CleanItem> {
     let mut result = ScanResult::default();
     let mut found = Vec::new();
     for (root, category) in cleanup_groups(home) {
@@ -351,7 +422,7 @@ pub fn scan_cleanup(home: &Path, cancel: &AtomicBool) -> ScanResult<CleanItem> {
             found.push((path, category))
         });
     }
-    let mut result = finish_items(found, result, cancel);
+    let mut result = finish_items(found, result, control);
     sort_largest_first(&mut result.items);
     result
 }
@@ -378,10 +449,10 @@ fn list_children(root: &Path, errors: &mut Vec<String>, mut add: impl FnMut(Path
 fn finish_items(
     found: Vec<(PathBuf, CleanCategory)>,
     mut result: ScanResult<CleanItem>,
-    cancel: &AtomicBool,
+    control: &Control,
 ) -> ScanResult<CleanItem> {
     let paths: Vec<PathBuf> = found.iter().map(|(path, _)| path.clone()).collect();
-    let sizes = measure_all(&paths, cancel).sizes;
+    let sizes = measure_all(&paths, control).sizes;
     for ((path, category), size) in found.into_iter().zip(sizes) {
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -442,13 +513,13 @@ pub fn installer_roots(home: &Path) -> Vec<PathBuf> {
 
 /// Finds installer images and packages directly inside each root or one
 /// folder below it, without following symlinks or opening app bundles.
-pub fn scan_installers(home: &Path, cancel: &AtomicBool) -> ScanResult<CleanItem> {
+pub fn scan_installers(home: &Path, control: &Control) -> ScanResult<CleanItem> {
     let mut result = ScanResult::default();
     let mut found = Vec::new();
     for root in installer_roots(home) {
         collect_installers(&root, 2, &mut found, &mut result.errors);
     }
-    let mut result = finish_items(found, result, cancel);
+    let mut result = finish_items(found, result, control);
     sort_largest_first(&mut result.items);
     result
 }
@@ -586,13 +657,13 @@ pub fn is_protected_disk_path(path: &Path, home: &Path) -> bool {
 
 // Applications --------------------------------------------------------------
 
-pub fn scan_apps(home: &Path, cancel: &AtomicBool) -> ScanResult<AppItem> {
+pub fn scan_apps(home: &Path, control: &Control) -> ScanResult<AppItem> {
     let mut result = ScanResult::default();
     let mut found = Vec::new();
     for root in [PathBuf::from("/Applications"), home.join("Applications")] {
         collect_apps(&root, 1, &mut found, &mut result.errors);
     }
-    result.items = describe_apps(found, home, cancel);
+    result.items = describe_apps(found, home, control);
     result.items.sort_by(|a, b| {
         a.name
             .to_lowercase()
@@ -633,7 +704,7 @@ fn collect_apps(root: &Path, depth: usize, found: &mut Vec<PathBuf>, errors: &mu
 
 /// Reads each app's metadata and measures the apps and their bundle-ID
 /// caches and logs in one walk.
-fn describe_apps(paths: Vec<PathBuf>, home: &Path, cancel: &AtomicBool) -> Vec<AppItem> {
+fn describe_apps(paths: Vec<PathBuf>, home: &Path, control: &Control) -> Vec<AppItem> {
     let mut apps: Vec<AppItem> = paths
         .into_iter()
         .map(|path| {
@@ -688,7 +759,7 @@ fn describe_apps(paths: Vec<PathBuf>, home: &Path, cancel: &AtomicBool) -> Vec<A
                 .map(|related| related.path.clone()),
         );
     }
-    let mut sizes = measure_all(&paths, cancel).sizes.into_iter();
+    let mut sizes = measure_all(&paths, control).sizes.into_iter();
     for app in &mut apps {
         let size = sizes.next().unwrap_or_default();
         app.bytes = size.bytes;
@@ -789,7 +860,7 @@ fn read_bundle_info(app_path: &Path) -> (Option<String>, Option<String>) {
 /// walked again. Unreadable entries are skipped and reported in `errors`;
 /// only an unreadable `root` fails. Returns new cache entries, including
 /// `root` itself when the walk finished.
-pub fn analyze_directory(root: &Path, cache: &SizeCache, cancel: &AtomicBool) -> DiskScan {
+pub fn analyze_directory(root: &Path, cache: &SizeCache, control: &Control) -> DiskScan {
     let mut result = ScanResult::default();
     let mut found = Vec::new();
     for entry in fs::read_dir(root)? {
@@ -816,7 +887,7 @@ pub fn analyze_directory(root: &Path, cache: &SizeCache, cancel: &AtomicBool) ->
         .map(|(entry, _)| entry.path())
         .filter(|path| !cache.contains_key(path))
         .collect();
-    let measured = measure_all(&uncached, cancel);
+    let measured = measure_all(&uncached, control);
     let mut sizes: HashMap<&PathBuf, Size> = uncached.iter().zip(measured.sizes).collect();
     for (entry, metadata) in found {
         let path = entry.path();
@@ -839,7 +910,7 @@ pub fn analyze_directory(root: &Path, cache: &SizeCache, cancel: &AtomicBool) ->
         .items
         .sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
     let mut folders = measured.folders;
-    if !cancel.load(Ordering::Relaxed) {
+    if !control.is_stopped() {
         let own = fs::symlink_metadata(root).map_or(0, |metadata| allocated(&metadata));
         folders.push((
             root.to_path_buf(),
@@ -881,13 +952,25 @@ fn search_enters(path: &Path, home: &Path, metadata: &fs::Metadata, device: u64)
 }
 
 /// Walks the home folder, outside Library and Trash, and calls `found` for
-/// entries it wants. `found` returns true to stop descending there.
+/// entries it wants. `found` returns true to stop descending there. Each
+/// home-folder child is its own root, so progress counts them as they finish.
 fn search_home(
     home: &Path,
-    cancel: &AtomicBool,
+    control: &Control,
     found: &(dyn Fn(&Path, &fs::Metadata) -> bool + Sync),
 ) -> Option<()> {
     let device = fs::symlink_metadata(home).ok()?.dev();
+    let mut starts = Vec::new();
+    for entry in fs::read_dir(home).ok()?.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !found(&path, &metadata) && search_enters(&path, home, &metadata, device) {
+            starts.push((starts.len(), path));
+        }
+    }
+    control.started(starts.len());
     let visit = |_: usize, path: &Path, metadata: &fs::Metadata| {
         let claimed = found(path, metadata);
         Visit {
@@ -896,7 +979,7 @@ fn search_home(
             complete: true,
         }
     };
-    walk(vec![(0, home.to_path_buf())], cancel, &visit);
+    walk(starts, control, &visit);
     Some(())
 }
 
@@ -905,7 +988,7 @@ pub fn scan_large_files(
     home: &Path,
     min_bytes: u64,
     min_age: Duration,
-    cancel: &AtomicBool,
+    control: &Control,
 ) -> ScanResult<CleanItem> {
     let now = SystemTime::now();
     let matches = Mutex::new(Vec::new());
@@ -921,7 +1004,7 @@ pub fn scan_large_files(
         false
     };
     let mut result = ScanResult::default();
-    if search_home(home, cancel, &found).is_none() {
+    if search_home(home, control, &found).is_none() {
         result
             .errors
             .push(format!("{}: cannot be read", home.display()));
@@ -929,14 +1012,14 @@ pub fn scan_large_files(
     let found = matches
         .into_inner()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut result = finish_items(found, result, cancel);
+    let mut result = finish_items(found, result, control);
     sort_largest_first(&mut result.items);
     result
 }
 
 /// Cargo `target` folders (marked with `CACHEDIR.TAG`) and npm
 /// `node_modules` folders next to a `package.json`.
-pub fn scan_build_folders(home: &Path, cancel: &AtomicBool) -> ScanResult<CleanItem> {
+pub fn scan_build_folders(home: &Path, control: &Control) -> ScanResult<CleanItem> {
     let matches = Mutex::new(Vec::new());
     let found = |path: &Path, metadata: &fs::Metadata| {
         let hit = metadata.is_dir() && is_build_folder(path);
@@ -946,7 +1029,7 @@ pub fn scan_build_folders(home: &Path, cancel: &AtomicBool) -> ScanResult<CleanI
         hit
     };
     let mut result = ScanResult::default();
-    if search_home(home, cancel, &found).is_none() {
+    if search_home(home, control, &found).is_none() {
         result
             .errors
             .push(format!("{}: cannot be read", home.display()));
@@ -954,7 +1037,7 @@ pub fn scan_build_folders(home: &Path, cancel: &AtomicBool) -> ScanResult<CleanI
     let found = matches
         .into_inner()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut result = finish_items(found, result, cancel);
+    let mut result = finish_items(found, result, control);
     sort_largest_first(&mut result.items);
     result
 }
@@ -1082,8 +1165,8 @@ pub mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/home")
     }
 
-    pub fn go() -> AtomicBool {
-        AtomicBool::new(false)
+    pub fn go() -> Control {
+        Control::default()
     }
 
     /// Independent size oracle: `du -sk` reports allocated KiB and counts
@@ -1190,8 +1273,33 @@ pub mod tests {
     }
 
     #[test]
+    fn progress_counts_every_measured_item_and_entry() {
+        let home = fixture_home();
+        let paths = [
+            home.join("Library"),
+            home.join("missing"),
+            home.join("Downloads/Setup.dmg"),
+        ];
+        let control = go();
+        assert_eq!(control.progress().fraction(), None, "nothing started yet");
+        measure_all(&paths, &control);
+        let progress = control.progress();
+        assert_eq!((progress.done, progress.total), (3, 3));
+        assert_eq!(progress.fraction(), Some(1.0));
+        // Library holds 5 children and 6 entries below them, so at least 11.
+        assert!(progress.checked >= 11, "{progress:?}");
+
+        let search = go();
+        scan_build_folders(&home, &search);
+        let progress = search.progress();
+        assert_eq!(progress.done, progress.total, "{progress:?}");
+        assert!(progress.total >= 2 && progress.checked > 0);
+    }
+
+    #[test]
     fn stopped_walk_marks_sizes_incomplete_and_caches_nothing() {
-        let stop = AtomicBool::new(true);
+        let stop = Control::default();
+        stop.stop();
         let measured = measure_all(&[fixture_home()], &stop);
         assert!(!measured.sizes[0].complete);
         assert!(measured.folders.is_empty());
