@@ -89,6 +89,110 @@ On this Mac's iCloud-synced Desktop and Documents folders, macOS can attach `Fin
 - `src/gui/treemap.rs`: squarified treemap layout for the disk map
 - `src/main.rs`: command-line flags and window setup
 
+<!-- git-understand:start -->
+## Project map
+
+MacCleanUp has two parts: a library that finds, sizes and guards files, and an egui window that drives it. All 39 links between the two point from the window into the library, so the library does not depend on the interface. The structure shown here is one commit older than the history.
+
+- src/scanner.rs has the most incoming links (6). It holds the path guards and identity checks that src/trash.rs runs before every move.
+- Only src/trash.rs moves anything to the Trash. The window reaches it through accept_confirmation in src/gui/state.rs.
+- format_bytes in src/model.rs is the most called function, with 12 calls.
+- src/gui/mod.rs is the largest hotspot: 2,159 lines, changed in all 3 commits.
+
+### Architecture
+
+The GUI layer makes 39 links into the Core Library layer, and 32 of them are calls. No link goes back from the library to the GUI, so the library tests run without a window.
+
+```mermaid
+flowchart TD
+  L0["GUI Application Layer<br/>5 files"]
+  L1["Build, Packaging and Docs<br/>4 files"]
+  L2["Core Library Layer<br/>5 files"]
+  L0 -->|39| L2
+  L1 -->|7| L0
+  L1 -->|4| L2
+```
+
+### Dependencies
+
+src/scanner.rs and src/model.rs are the two files that most others depend on. src/trash.rs calls the guard and identity functions in src/scanner.rs before each move.
+
+6 of 14 files: the most connected ones, test files left out, joined by the 10 strongest of the 30 links between them.
+
+```mermaid
+flowchart LR
+  subgraph G0["GUI Application Layer"]
+    direction TB
+    N1["mod.rs"]
+    N3["state.rs"]
+  end
+  subgraph G2["Core Library Layer"]
+    direction TB
+    N2["scanner.rs"]
+    N4["trash.rs"]
+    N6["model.rs"]
+    N9["system.rs"]
+  end
+  N1 --> N3
+  N1 --> N6
+  N4 --> N2
+  N3 --> N2
+  N3 --> N4
+  N3 --> N9
+  N1 --> N2
+  N9 --> N2
+  N3 --> N6
+  N1 --> N4
+```
+
+### Composition
+
+The Rust source is 6,236 lines in 10 files. Cargo.lock is most of the rest, at 4,638 lines.
+
+42 files, 11293 lines.
+
+| Language | Files | Lines |
+|---|---:|---:|
+| Rust | 10 | 6236 |
+| Lockfile | 1 | 4638 |
+| Docs | 3 | 204 |
+| Other | 20 | 85 |
+| Shell | 1 | 83 |
+| TOML | 1 | 32 |
+| Config | 3 | 12 |
+| JavaScript | 2 | 2 |
+
+### History
+
+The history has 3 commits from one day, and each release changed most files. The pairs that change together, such as scripts/build-app.sh with the source files, come from version bumps, not from code that depends on each other.
+
+3 commits, 2026-11-23.
+
+| Hotspot | Commits | Lines |
+|---|---:|---:|
+| `src/gui/mod.rs` | 3 | 2159 |
+| `src/scanner.rs` | 3 | 1589 |
+| `src/gui/state.rs` | 3 | 1363 |
+| `src/trash.rs` | 3 | 436 |
+| `src/system.rs` | 3 | 247 |
+| `src/model.rs` | 2 | 146 |
+| `scripts/build-app.sh` | 3 | 83 |
+
+src/gui/mod.rs, src/scanner.rs and src/gui/state.rs are complex, and each one changed in every commit. Those three files hold most of the Rust code, so most of the risk sits there too.
+
+| Changed together | Commits | Linked in code |
+|---|---:|---|
+| `scripts/build-app.sh` + `src/gui/mod.rs` | 3 | no |
+| `scripts/build-app.sh` + `src/gui/state.rs` | 3 | no |
+| `scripts/build-app.sh` + `src/scanner.rs` | 3 | no |
+| `scripts/build-app.sh` + `src/system.rs` | 3 | no |
+| `scripts/build-app.sh` + `src/trash.rs` | 3 | no |
+| `src/gui/mod.rs` + `src/gui/state.rs` | 3 | yes |
+| `src/gui/mod.rs` + `src/scanner.rs` | 3 | yes |
+| `src/gui/mod.rs` + `src/system.rs` | 3 | no |
+
+<!-- git-understand:end -->
+
 ## Reference
 
 Mole 1.74.0 (GPL-3.0) supplied the behavior and safety requirements reviewed for this independent implementation. No Mole scripts or binaries are bundled or invoked.
