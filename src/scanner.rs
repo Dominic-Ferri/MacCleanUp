@@ -428,7 +428,7 @@ pub fn scan_cleanup(home: &Path, control: &Control) -> ScanResult<CleanItem> {
 }
 
 /// Calls `add` for each entry of `root`. A missing root is not an error.
-fn list_children(root: &Path, errors: &mut Vec<String>, mut add: impl FnMut(PathBuf)) {
+pub(crate) fn list_children(root: &Path, errors: &mut Vec<String>, mut add: impl FnMut(PathBuf)) {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
@@ -446,7 +446,7 @@ fn list_children(root: &Path, errors: &mut Vec<String>, mut add: impl FnMut(Path
 }
 
 /// Measures the found paths together and turns them into unselected items.
-fn finish_items(
+pub(crate) fn finish_items(
     found: Vec<(PathBuf, CleanCategory)>,
     mut result: ScanResult<CleanItem>,
     control: &Control,
@@ -477,12 +477,13 @@ fn finish_items(
             selected: false,
             complete: size.complete,
             modified: metadata.modified().ok(),
+            note: None,
         });
     }
     result
 }
 
-fn sort_largest_first(items: &mut [CleanItem]) {
+pub(crate) fn sort_largest_first(items: &mut [CleanItem]) {
     items.sort_by(|a, b| {
         b.bytes
             .cmp(&a.bytes)
@@ -832,26 +833,38 @@ pub fn exact_bundle_caches(home: &Path, bundle_id: &str) -> [PathBuf; 2] {
 
 /// Reads `CFBundleIdentifier` and `CFBundleShortVersionString` from the app's Info.plist.
 fn read_bundle_info(app_path: &Path) -> (Option<String>, Option<String>) {
-    let plist = app_path.join("Contents/Info.plist");
-    #[allow(deprecated)]
-    objc2::rc::autoreleasepool(|_| {
-        let path = NSString::from_str(&plist.to_string_lossy());
-        let Some(dictionary) =
-            (unsafe { NSDictionary::<NSString, AnyObject>::dictionaryWithContentsOfFile(&path) })
-        else {
-            return (None, None);
-        };
-        let text = |key: &NSString| {
-            dictionary
-                .objectForKey(key)
-                .and_then(|value| value.downcast::<NSString>().ok())
-                .map(|value| value.to_string())
-        };
+    with_plist(&app_path.join("Contents/Info.plist"), |dictionary| {
         (
-            text(ns_string!("CFBundleIdentifier")),
-            text(ns_string!("CFBundleShortVersionString")),
+            plist_text(dictionary, ns_string!("CFBundleIdentifier")),
+            plist_text(dictionary, ns_string!("CFBundleShortVersionString")),
         )
     })
+    .unwrap_or((None, None))
+}
+
+/// Runs `read` on a property list file (XML or binary) whose top level is a
+/// dictionary. None when the file is missing, unreadable, or not a dictionary.
+pub(crate) fn with_plist<R>(
+    file: &Path,
+    read: impl FnOnce(&NSDictionary<NSString, AnyObject>) -> R,
+) -> Option<R> {
+    #[allow(deprecated)]
+    objc2::rc::autoreleasepool(|_| {
+        let path = NSString::from_str(&file.to_string_lossy());
+        let dictionary =
+            unsafe { NSDictionary::<NSString, AnyObject>::dictionaryWithContentsOfFile(&path) }?;
+        Some(read(&dictionary))
+    })
+}
+
+pub(crate) fn plist_text(
+    dictionary: &NSDictionary<NSString, AnyObject>,
+    key: &NSString,
+) -> Option<String> {
+    dictionary
+        .objectForKey(key)
+        .and_then(|value| value.downcast::<NSString>().ok())
+        .map(|value| value.to_string())
 }
 
 // Disk map ------------------------------------------------------------------

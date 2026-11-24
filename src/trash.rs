@@ -1,3 +1,4 @@
+use crate::leftovers::is_safe_leftover_path;
 use crate::model::{AppItem, CleanCategory, CleanItem, DiskItem, OperationResult, RelatedPath};
 use crate::scanner::{
     identity_matches, is_protected_disk_path, is_safe_app_data_path, is_safe_app_path,
@@ -18,6 +19,9 @@ fn passes_guard(item: &CleanItem, home: &Path) -> bool {
         CleanCategory::Installer => is_safe_installer_path(&item.path, home),
         CleanCategory::LargeFile => is_safe_large_file_path(&item.path, home),
         CleanCategory::BuildFolder => is_safe_build_folder_path(&item.path, home),
+        CleanCategory::LaunchItem | CleanCategory::Leftover => {
+            is_safe_leftover_path(&item.path, item.category, home)
+        }
     }
 }
 
@@ -192,16 +196,19 @@ fn move_one(path: &Path, bytes: u64, result: &mut OperationResult) -> bool {
 /// `NSFileWriteNoPermissionError`: macOS refused this app the move.
 const NO_PERMISSION: isize = 513;
 
-fn trash_path(path: &Path) -> Result<(), String> {
-    let direct = objc2::rc::autoreleasepool(|_| {
+fn trash_directly(path: &Path) -> Result<(), (isize, String)> {
+    objc2::rc::autoreleasepool(|_| {
         let path_string = NSString::from_str(&path.to_string_lossy());
         let url = NSURL::fileURLWithPath(&path_string);
         let manager = NSFileManager::defaultManager();
         manager
             .trashItemAtURL_resultingItemURL_error(&url, None)
             .map_err(|error| (error.code(), error.localizedDescription().to_string()))
-    });
-    match direct {
+    })
+}
+
+fn trash_path(path: &Path) -> Result<(), String> {
+    match trash_directly(path) {
         Ok(()) => Ok(()),
         Err((NO_PERMISSION, message)) => trash_with_finder(path)
             .map_err(|finder| format!("{message} Finder could not move it either: {finder}")),
@@ -263,6 +270,7 @@ mod tests {
             selected,
             complete: true,
             modified: None,
+            note: None,
         }
     }
 
@@ -434,5 +442,21 @@ mod tests {
         assert_eq!(result.moved, 0);
         assert_eq!(result.failures.len(), 1);
         assert!(item.path.exists());
+    }
+
+    /// System items in /Library sit in root-owned folders. Make a scratch
+    /// copy of that situation first:
+    /// `sudo mkdir -p target/test-scratch/root-owned && sudo touch target/test-scratch/root-owned/com.example.helper.plist`
+    /// then run `cargo test root_owned -- --ignored --nocapture`. The direct
+    /// move must be refused with the code that sends the item to Finder.
+    #[test]
+    #[ignore]
+    fn root_owned_items_are_refused_with_the_finder_code() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-scratch/root-owned/com.example.helper.plist");
+        let result = trash_directly(&path);
+        println!("{result:?}");
+        assert!(matches!(result, Err((NO_PERMISSION, _))), "{result:?}");
+        assert!(path.exists());
     }
 }

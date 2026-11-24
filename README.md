@@ -71,11 +71,12 @@ A sidebar lists the views. Lists have a details panel on the right that shows wh
 - **Installer files:** `.dmg`, `.pkg`, `.mpkg`, `.iso`, and `.xip` files, plus `.pkg` and `.mpkg` bundle folders, in `~/Downloads`, `~/Desktop`, `~/Documents`, `~/Public`, `~/Library/Downloads`, and iCloud Drive's Downloads folder, directly or one folder below. ZIP archives are not inspected.
 - **Large old files:** files that use 1 GB or more on disk and have not changed for 180 days, anywhere in the home folder except `~/Library` and the Trash.
 - **Build folders:** Cargo `target` folders that contain `CACHEDIR.TAG`, and npm `node_modules` folders next to a `package.json`, anywhere in the home folder except `~/Library` and the Trash.
+- **Leftovers:** two groups, both unselected. *Startup items, program gone* are launch agents and daemons in `~/Library/LaunchAgents`, `/Library/LaunchAgents`, and `/Library/LaunchDaemons` whose program path macOS reports as not found. A program on a disk that is not connected, or in a folder MacCleanUp cannot open, is not reported. *Possible leftovers* are entries named after a bundle ID that no installed app uses: in `Application Support`, `Preferences`, `HTTPStorages`, `WebKit`, and `Saved Application State` in `~/Library`, in `/Library/Application Support`, and privileged helpers in `/Library/PrivilegedHelperTools` with their launch daemons. Installed apps are found in `/Applications`, `~/Applications`, and `/Library/Application Support`, including vendor folders, helpers inside app bundles, and the helpers an app declares. A name counts as used when any installed app shares its vendor prefix. Apple names, app-group names of installed apps, and names that code libraries write under their own vendor are never listed. These are guesses from names, and a command-line tool may still use one. Items in `/Library` move through Finder, which asks for an administrator password. A moved startup item that is already running stops at the next restart or log-out.
 - **Disk map:** the items in a folder drawn to scale as a treemap, with a sortable list below it. Click a tile or row for details; double-click a folder to open it. Use Up, the breadcrumb path, or the path field (`~` is accepted) to move around. Sizes of large folders are kept until you quit, so going back to a folder you already measured is fast. **Measure again** discards them, and any Trash operation discards the sizes it changed.
 - **System:** processor, macOS version, memory, startup disk use, load average, and uptime, updated every 2 seconds, plus the size of the Trash and the number of Time Machine local snapshots. If macOS does not let MacCleanUp read the Trash, the size shows as unavailable, not as zero. A performance check lists any app or system process that averaged 80% or more of one processor core over the last 30 seconds (a result appears after 20 seconds on the page). It only reads CPU time; it never quits or pauses anything.
 - **Activity:** every Trash operation since the app opened, with each path that moved and any failures.
 
-Caches and Applications scan together when the app opens. Installer files, Large old files, Build folders, Disk map, and the storage measurement wait for a click, because they read Desktop, Documents, and Downloads, and macOS may ask MacCleanUp for access to those folders the first time. The searches do not open `~/Library`, the Trash, app bundles, or Photos libraries, and do not cross onto other volumes.
+Caches and Applications scan together when the app opens. Installer files, Large old files, Build folders, Disk map, and the storage measurement wait for a click, because they read Desktop, Documents, and Downloads, and macOS may ask MacCleanUp for access to those folders the first time. Leftovers also waits for a click; it reads only the Library folders named above. The file searches do not open `~/Library`, the Trash, app bundles, or Photos libraries, and do not cross onto other volumes.
 
 Lists can be filtered by name and sorted by name, size, or last change.
 
@@ -83,7 +84,7 @@ Lists can be filtered by name and sorted by name, size, or last change.
 
 | Key | Action |
 | --- | --- |
-| `Cmd-1` to `Cmd-9`, `Cmd-0` | Switch view |
+| `Cmd-1` to `Cmd-9`, `Cmd-0` | Switch to one of the first ten views |
 | `Cmd-R` | Scan the current view again |
 | `↑` / `↓` | Move through a list |
 | `Space` | Select the highlighted item |

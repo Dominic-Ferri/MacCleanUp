@@ -7,7 +7,7 @@ use eframe::egui::{
     RichText, Sense, Stroke, StrokeKind, Ui, Vec2,
 };
 use egui_extras::{Column, TableBuilder};
-use maccleanup::model::{format_bytes, CleanItem};
+use maccleanup::model::{format_bytes, CleanCategory, CleanItem};
 use maccleanup::scanner::is_protected_disk_path;
 use maccleanup::system::StoragePart;
 use maccleanup::trash::related_app_data;
@@ -376,6 +376,13 @@ impl MacCleanUp {
                 "Find build folders",
                 "Review build folders",
             ),
+            search_row(
+                state,
+                Section::Leftovers,
+                "Startup items and app data that no installed app uses.",
+                "Find leftovers",
+                "Review leftovers",
+            ),
             (
                 Section::Disk,
                 "See which folders in your home folder are largest.".to_string(),
@@ -451,6 +458,13 @@ impl MacCleanUp {
             SortKey::Name => rows.sort_by_cached_key(|row| row.1.to_lowercase()),
             SortKey::Modified => rows.sort_by_key(|row| std::cmp::Reverse(row.3)),
         }
+        if let Some(items) = state
+            .items(section)
+            .filter(|_| section == Section::Leftovers)
+        {
+            // Certain finds stay above the guesses whatever the sort.
+            rows.sort_by_key(|row| items[row.0].category != CleanCategory::LaunchItem);
+        }
         rows.into_iter().map(|row| row.0).collect()
     }
 
@@ -514,6 +528,7 @@ impl MacCleanUp {
                 match section {
                     Section::Installers => "Scan looks in Downloads, Desktop, Documents, Public, and iCloud Downloads. macOS may ask MacCleanUp for access to those folders the first time.",
                     Section::LargeFiles | Section::BuildFolders => "Scan looks through your whole home folder except Library and the Trash, so it takes a while. macOS may ask MacCleanUp for access to Desktop, Documents, and Downloads the first time.",
+                    Section::Leftovers => "Scan reads the startup items in LaunchAgents and LaunchDaemons, the helpers in PrivilegedHelperTools, and the folders in Application Support, Preferences, and other parts of Library, and compares them with the apps installed in the Applications folders.",
                     _ if self.state.is_stopped(section) => "The scan was stopped. Scan to see what is here.",
                     _ => "Scan to see what is here.",
                 },
@@ -534,6 +549,7 @@ impl MacCleanUp {
                         "No file of 1 GB or more has gone unchanged for 6 months."
                     }
                     Section::BuildFolders => "No Cargo or npm build folders were found.",
+                    Section::Leftovers => "Every startup item's program is in place, and every app data name belongs to an installed app.",
                     _ => "Nothing to clear here right now.",
                 }
             } else {
@@ -551,7 +567,7 @@ impl MacCleanUp {
         let all_selected = order.iter().all(|&index| self.is_selected(index));
         let third = match section {
             Section::Applications => "Version",
-            Section::Clean => "Type",
+            Section::Clean | Section::Leftovers => "Type",
             _ => "Folder",
         };
         let row_height = 30.0;
@@ -681,6 +697,8 @@ impl MacCleanUp {
                 friendly_name(&item.name, &state.app_names),
                 item.category.label().to_string(),
             )
+        } else if state.section == Section::Leftovers {
+            (item.name.clone(), item.category.label().to_string())
         } else {
             let folder = item
                 .path
@@ -1473,6 +1491,11 @@ impl MacCleanUp {
                 inspector_title(ui, &shown, item.category.label());
                 ui.label(RichText::new("What it is").font(medium(13.0)).color(SILT));
                 ui.label(item.category.explanation());
+                if let Some(note) = &item.note {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Why it is listed").font(medium(13.0)).color(SILT));
+                    ui.label(note);
+                }
                 ui.add_space(12.0);
                 fact(ui, "Size", &size_text(item.bytes, item.complete));
                 fact(ui, "Changed", &age(item.modified));
@@ -2620,6 +2643,7 @@ mod tests {
             complete: true,
             identity: None,
             modified: None,
+            note: None,
         }];
         state.breakdown = Some(Breakdown {
             files: Size {
@@ -2802,6 +2826,79 @@ mod tests {
         nav(&mut harness, "Large old files");
         harness.run_steps(2);
         harness.get_by_label("Not scanned yet");
+    }
+
+    #[test]
+    fn leftovers_wait_for_a_scan_and_explain_each_item() {
+        let mut harness = harness(fixture_home());
+        settle(&mut harness);
+        nav(&mut harness, "Leftovers");
+        harness.run_steps(2);
+        harness.get_by_label("Not scanned yet");
+        harness.get_by_label("Scan").click();
+        settle(&mut harness);
+        assert!(harness.state().state.is_loaded(Section::Leftovers));
+        assert!(harness
+            .state()
+            .state
+            .leftover_items
+            .iter()
+            .all(|item| !item.selected));
+        // Fixed rows, so the picture does not depend on this Mac's Library.
+        let item = |path: &str, category, bytes, note: &str| CleanItem {
+            id: path.to_string(),
+            category,
+            name: Path::new(path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            path: PathBuf::from(path),
+            bytes,
+            selected: false,
+            complete: true,
+            identity: None,
+            modified: None,
+            note: Some(note.to_string()),
+        };
+        let state = &mut harness.state_mut().state;
+        state.leftover_items = vec![
+            item(
+                "/Library/LaunchDaemons/com.example.updater.plist",
+                CleanCategory::LaunchItem,
+                4_096,
+                "com.example.updater starts /Applications/Example.app/Contents/MacOS/Updater, which is no longer on this Mac.",
+            ),
+            item(
+                "/Library/PrivilegedHelperTools/com.example.helper",
+                CleanCategory::Leftover,
+                2_764_800,
+                "A background helper that runs with administrator rights. No installed app declares com.example.helper.",
+            ),
+            item(
+                "/Users/example/Library/Application Support/com.example.notes",
+                CleanCategory::Leftover,
+                9_936_896,
+                "No installed app uses com.example.notes. A command-line tool may still use it, so check before you move it.",
+            ),
+        ];
+        state.set_focus(0);
+        state.message = "Found 3 items.".to_string();
+        harness.run_steps(3);
+        // The smallest item is a certain find, so it stays first under the
+        // size sort.
+        assert_eq!(harness.state().visible_order(), [0, 2, 1]);
+        assert!(
+            harness
+                .query_all_by_label("Startup item, program gone")
+                .count()
+                >= 2,
+            "row and details panel name the kind"
+        );
+        assert_eq!(harness.query_all_by_label("Possible leftover").count(), 2);
+        harness.get_by_label("Why it is listed");
+        harness.get_by_label_contains("which is no longer on this Mac");
+        shot(&mut harness, "leftovers");
     }
 
     #[test]

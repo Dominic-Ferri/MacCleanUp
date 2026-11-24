@@ -20,6 +20,8 @@ pub struct CleanItem {
     pub complete: bool,
     pub identity: Option<ItemIdentity>,
     pub modified: Option<SystemTime>,
+    /// Why this one item was listed, when the category alone does not say.
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +33,8 @@ pub enum CleanCategory {
     Installer,
     LargeFile,
     BuildFolder,
+    LaunchItem,
+    Leftover,
 }
 
 impl CleanCategory {
@@ -43,6 +47,8 @@ impl CleanCategory {
             Self::Installer => "Installer",
             Self::LargeFile => "Large file",
             Self::BuildFolder => "Build folder",
+            Self::LaunchItem => "Startup item, program gone",
+            Self::Leftover => "Possible leftover",
         }
     }
 
@@ -57,6 +63,8 @@ impl CleanCategory {
             Self::Installer => "A disk image or package you downloaded to install an app. The installed app keeps working without it.",
             Self::LargeFile => "A file of 1 GB or more that has not changed in at least 6 months. Check what it is before you remove it: it can be a video, a backup, or a virtual machine disk that you still need.",
             Self::BuildFolder => "Files a build tool made from a project's source code: a Cargo target folder or an npm node_modules folder. The project's source stays. The next build or npm install makes the folder again, and takes longer.",
+            Self::LaunchItem => "A small file that tells macOS to start a program at login or at startup. The program it names is no longer on this Mac, usually because its app was removed, so macOS tries to start it and fails. Removing the file stops those tries; it stops fully after the next restart.",
+            Self::Leftover => "Settings, data, or a background helper named after an app that is not installed. It is often left behind when an app is removed by dragging it to the Trash. MacCleanUp guesses this from the name, so check it first: a command-line tool, or an app outside the Applications folders, may still use it.",
         }
     }
 }

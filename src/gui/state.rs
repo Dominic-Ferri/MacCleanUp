@@ -1,5 +1,6 @@
 //! Application state and background jobs, independent of drawing.
 
+use maccleanup::leftovers::scan_leftovers;
 use maccleanup::model::{format_bytes, AppItem, CleanItem, DiskItem, OperationResult};
 use maccleanup::scanner::Control;
 #[cfg(test)]
@@ -36,13 +37,14 @@ pub enum Section {
     Installers,
     LargeFiles,
     BuildFolders,
+    Leftovers,
     Disk,
     Status,
     Activity,
 }
 
 impl Section {
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 11;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Overview,
         Self::Storage,
@@ -51,6 +53,7 @@ impl Section {
         Self::Installers,
         Self::LargeFiles,
         Self::BuildFolders,
+        Self::Leftovers,
         Self::Disk,
         Self::Status,
         Self::Activity,
@@ -65,6 +68,7 @@ impl Section {
             Self::Installers => "Installer files",
             Self::LargeFiles => "Large old files",
             Self::BuildFolders => "Build folders",
+            Self::Leftovers => "Leftovers",
             Self::Disk => "Disk map",
             Self::Status => "System",
             Self::Activity => "Activity",
@@ -80,6 +84,7 @@ impl Section {
             Self::Installers => "Disk images and packages left in Downloads, Desktop, Documents, Public, and iCloud Downloads.",
             Self::LargeFiles => "Files of 1 GB or more, unchanged for 6 months, anywhere in your home folder outside Library.",
             Self::BuildFolders => "Cargo target and npm node_modules folders in your projects. Your build tools make them again.",
+            Self::Leftovers => "Startup items whose program is gone, and settings, data, and helpers that no installed app uses.",
             Self::Disk => "The largest items in a folder, drawn to scale. Double-click a folder to open it.",
             Self::Status => "Memory, storage, and load. Updates every 2 seconds.",
             Self::Activity => "Everything MacCleanUp moved to Trash since it opened.",
@@ -108,7 +113,11 @@ impl Section {
     pub fn has_clean_items(self) -> bool {
         matches!(
             self,
-            Self::Clean | Self::Installers | Self::LargeFiles | Self::BuildFolders
+            Self::Clean
+                | Self::Installers
+                | Self::LargeFiles
+                | Self::BuildFolders
+                | Self::Leftovers
         )
     }
 }
@@ -189,6 +198,7 @@ pub struct State {
     pub installer_items: Vec<CleanItem>,
     pub large_items: Vec<CleanItem>,
     pub build_items: Vec<CleanItem>,
+    pub leftover_items: Vec<CleanItem>,
     /// Installed app names by lowercased bundle ID, for cache folder names.
     pub app_names: HashMap<String, String>,
     pub disk_items: Vec<DiskItem>,
@@ -252,6 +262,7 @@ impl State {
             installer_items: Vec::new(),
             large_items: Vec::new(),
             build_items: Vec::new(),
+            leftover_items: Vec::new(),
             app_names: HashMap::new(),
             disk_items: Vec::new(),
             focus: [None; Section::COUNT],
@@ -311,6 +322,7 @@ impl State {
             Section::Installers => Some(&self.installer_items),
             Section::LargeFiles => Some(&self.large_items),
             Section::BuildFolders => Some(&self.build_items),
+            Section::Leftovers => Some(&self.leftover_items),
             _ => None,
         }
     }
@@ -321,6 +333,7 @@ impl State {
             Section::Installers => Some(&mut self.installer_items),
             Section::LargeFiles => Some(&mut self.large_items),
             Section::BuildFolders => Some(&mut self.build_items),
+            Section::Leftovers => Some(&mut self.leftover_items),
             _ => None,
         }
     }
@@ -443,6 +456,7 @@ impl State {
                 scan_large_files(home, LARGE_FILE_BYTES, LARGE_FILE_AGE, cancel)
             })),
             Section::BuildFolders => Some(("Looking for build folders", scan_build_folders)),
+            Section::Leftovers => Some(("Looking for leftovers", scan_leftovers)),
             _ => None,
         };
         if let Some((label, scan)) = list {
@@ -992,12 +1006,32 @@ impl State {
                     Section::Installers => "Installed apps keep working without their installers.",
                     Section::LargeFiles => "Check each file before you move it. MacCleanUp cannot tell whether you still need it.",
                     Section::BuildFolders => "The projects' source code stays. Build again to make these folders again.",
+                    Section::Leftovers => "MacCleanUp guessed the possible leftovers from their names. Check each one before you move it. Put Back in the Trash restores any item.",
                     _ => "Apps rebuild caches when they need them. Close an app first if you are clearing its cache.",
                 };
+                let mut notes = vec![note.to_string()];
+                if section == Section::Leftovers {
+                    let selected = || items.iter().filter(|item| item.selected);
+                    if selected().any(|item| {
+                        item.path.extension().is_some_and(|e| e == "plist")
+                            && item
+                                .path
+                                .parent()
+                                .and_then(Path::file_name)
+                                .is_some_and(|folder| {
+                                    folder == "LaunchAgents" || folder == "LaunchDaemons"
+                                })
+                    }) {
+                        notes.push("A startup item that is already running stops at the next restart or log-out.".to_string());
+                    }
+                    if selected().any(|item| !item.path.starts_with(&self.home)) {
+                        notes.push("Items in /Library belong to the whole Mac. macOS asks for an administrator password to move them.".to_string());
+                    }
+                }
                 Confirmation {
                     title: format!("Move {} to Trash?", plural(moves.len(), "item", "items")),
                     button: "Move to Trash".to_string(),
-                    notes: vec![note.to_string()],
+                    notes,
                     moves,
                     action: PendingAction::Items(section),
                 }
@@ -1395,6 +1429,49 @@ mod tests {
         state.review();
         assert!(state.confirmation.is_none());
         assert!(state.message.contains("protected"));
+    }
+
+    #[test]
+    fn leftover_review_warns_about_running_and_system_items_only_when_selected() {
+        use maccleanup::model::{CleanCategory, CleanItem};
+        let home = fixture_home();
+        let mut state = State::new(home.clone());
+        state.section = Section::Leftovers;
+        let item = |path: PathBuf, category, selected| CleanItem {
+            id: path.to_string_lossy().into_owned(),
+            category,
+            name: "item".to_string(),
+            path,
+            bytes: 1,
+            selected,
+            complete: true,
+            identity: None,
+            modified: None,
+            note: None,
+        };
+        state.leftover_items = vec![
+            item(
+                home.join("Library/Application Support/com.gone.data"),
+                CleanCategory::Leftover,
+                true,
+            ),
+            item(
+                PathBuf::from("/Library/LaunchDaemons/com.gone.helper.plist"),
+                CleanCategory::Leftover,
+                false,
+            ),
+        ];
+        state.review();
+        let notes = &state.confirmation.take().expect("dialog").notes;
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("guessed"));
+
+        state.leftover_items[1].selected = true;
+        state.review();
+        let notes = &state.confirmation.take().expect("dialog").notes;
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        assert!(notes[1].contains("restart"));
+        assert!(notes[2].contains("administrator password"));
     }
 
     #[test]
