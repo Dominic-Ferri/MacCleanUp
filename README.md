@@ -146,7 +146,7 @@ MacCleanUp has two parts: a library that finds, sizes and guards files, and an e
 - src/scanner.rs has the most incoming links (6). It holds the path guards and identity checks that src/trash.rs runs before every move.
 - Only src/trash.rs moves anything to the Trash. The window reaches it through accept_confirmation in src/gui/state.rs.
 - format_bytes in src/model.rs is the most called function, with 12 calls.
-- src/gui/mod.rs is the largest hotspot, at 2,841 lines.
+- src/gui/mod.rs is the largest hotspot, at 2,922 lines.
 
 ### Architecture
 
@@ -196,17 +196,17 @@ flowchart LR
 
 ### Composition
 
-The Rust source is 7,409 lines in 10 files. Cargo.lock is most of the rest, at 4,638 lines.
+The Rust source is 7,728 lines in 10 files. Cargo.lock is most of the rest, at 4,638 lines.
 
-42 files, 12503 lines.
+49 files, 12909 lines.
 
 | Language | Files | Lines |
 |---|---:|---:|
-| Rust | 10 | 7409 |
+| Rust | 10 | 7728 |
 | Lockfile | 1 | 4638 |
-| Docs | 3 | 241 |
-| Other | 20 | 85 |
-| Shell | 1 | 83 |
+| Docs | 3 | 256 |
+| Shell | 2 | 155 |
+| Other | 26 | 85 |
 | TOML | 1 | 32 |
 | Config | 3 | 12 |
 | JavaScript | 2 | 2 |
@@ -215,29 +215,29 @@ The Rust source is 7,409 lines in 10 files. Cargo.lock is most of the rest, at 4
 
 The history is short and comes from one day. scripts/build-app.sh changes with the source files because each release raises its version number, not because the code depends on it.
 
-7 commits, 2026-11-23.
+10 commits, 2026-11-23 to 2026-11-24.
 
 | Hotspot | Commits | Lines |
 |---|---:|---:|
-| `src/gui/mod.rs` | 5 | 2841 |
-| `src/gui/state.rs` | 5 | 1437 |
+| `src/gui/mod.rs` | 7 | 2922 |
+| `src/gui/state.rs` | 6 | 1499 |
+| `src/system.rs` | 6 | 834 |
 | `src/scanner.rs` | 3 | 1589 |
-| `src/system.rs` | 5 | 658 |
 | `src/trash.rs` | 4 | 438 |
-| `scripts/build-app.sh` | 6 | 83 |
+| `scripts/build-app.sh` | 7 | 87 |
 | `src/model.rs` | 2 | 146 |
 | `src/gui/theme.rs` | 2 | 134 |
 
-src/gui/mod.rs, src/gui/state.rs and src/scanner.rs are complex, and together they hold 5,867 of the 7,409 Rust lines. Most of the risk sits in those three files.
+src/gui/mod.rs, src/gui/state.rs and src/scanner.rs are complex, and together they hold 6,010 of the 7,728 Rust lines. Most of the risk sits in those three files.
 
 | Changed together | Commits | Linked in code |
 |---|---:|---|
-| `scripts/build-app.sh` + `src/gui/mod.rs` | 5 | no |
-| `scripts/build-app.sh` + `src/gui/state.rs` | 5 | no |
-| `scripts/build-app.sh` + `src/system.rs` | 5 | no |
-| `src/gui/mod.rs` + `src/gui/state.rs` | 5 | yes |
-| `src/gui/mod.rs` + `src/system.rs` | 5 | no |
-| `src/gui/state.rs` + `src/system.rs` | 5 | yes |
+| `scripts/build-app.sh` + `src/gui/mod.rs` | 6 | no |
+| `scripts/build-app.sh` + `src/gui/state.rs` | 6 | no |
+| `scripts/build-app.sh` + `src/system.rs` | 6 | no |
+| `src/gui/mod.rs` + `src/gui/state.rs` | 6 | yes |
+| `src/gui/mod.rs` + `src/system.rs` | 6 | no |
+| `src/gui/state.rs` + `src/system.rs` | 6 | yes |
 | `scripts/build-app.sh` + `src/trash.rs` | 4 | no |
 | `scripts/build-app.sh` + `src/scanner.rs` | 3 | no |
 
