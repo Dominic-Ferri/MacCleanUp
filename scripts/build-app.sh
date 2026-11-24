@@ -9,8 +9,9 @@ STAGE="$HOME/.local/share/maccleanup/stage-$(date +%Y%m%d-%H%M%S)"
 APP="$STAGE/MacCleanUp.app"
 FINAL_DIR="$ROOT/build/$VERSION"
 FINAL="$FINAL_DIR/MacCleanUp.app"
+# Apple silicon only: macOS 27 warns that apps carrying Intel code will not
+# open in macOS 28, and every Mac that runs macOS 28 is Apple silicon.
 ARM="$ROOT/target/aarch64-apple-darwin/release/MacCleanUp"
-INTEL="$ROOT/target/x86_64-apple-darwin/release/MacCleanUp"
 ICON="$ROOT/assets/MacCleanUp.icns"
 
 if [[ ! -f "$ICON" ]]; then
@@ -24,12 +25,15 @@ fi
 
 export MACOSX_DEPLOYMENT_TARGET=12.0
 cargo build --manifest-path "$ROOT/Cargo.toml" --release --target aarch64-apple-darwin
-cargo build --manifest-path "$ROOT/Cargo.toml" --release --target x86_64-apple-darwin
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE"
 cp "$ICON" "$APP/Contents/Resources/MacCleanUp.icns"
-lipo -create "$ARM" "$INTEL" -output "$APP/Contents/MacOS/MacCleanUp"
+cp "$ARM" "$APP/Contents/MacOS/MacCleanUp"
+if [[ "$(lipo -archs "$APP/Contents/MacOS/MacCleanUp")" != "arm64" ]]; then
+    echo "error: the executable must contain only arm64 code" >&2
+    exit 1
+fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -44,7 +48,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key><string>MacCleanUp</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
-    <key>CFBundleVersion</key><string>8</string>
+    <key>CFBundleVersion</key><string>9</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>NSHighResolutionCapable</key><true/>

@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  macOS 12 or later &nbsp;·&nbsp; Apple Silicon and Intel &nbsp;·&nbsp; MIT license
+  macOS 12 or later &nbsp;·&nbsp; Apple silicon &nbsp;·&nbsp; MIT license
 </p>
 
 ![The Storage view: every part of the startup disk with its size, and the details of the selected part](docs/screenshots/storage.png)
@@ -21,6 +21,7 @@
 - **Finds what is safe to clear.** Caches and logs, leftover installers, large files you have not touched in six months, and Cargo and npm build folders.
 - **Uninstalls apps cleanly.** An app goes to the Trash with its exact caches and logs. Its settings and data go too, only if you tick the box.
 - **Maps any folder.** A treemap draws a folder's contents to scale, and you can open any folder in it.
+- **Spots runaway processes.** The System view names any app or system process that kept a processor core busy for the last half minute. It only looks; it never quits anything.
 - **Never deletes.** Everything goes to the Trash after a review dialog that lists every path, so you can restore anything until you empty the Trash.
 
 | Overview | Review before anything moves |
@@ -31,19 +32,31 @@
 
 ## Install
 
-MacCleanUp has no installer. Build it from source, then open `build/<version>/MacCleanUp.app`. The build needs Rust 1.85 or later (from [rustup](https://rustup.rs)), the Apple Silicon and Intel targets, and the Xcode Command Line Tools for `lipo` and `codesign`:
+MacCleanUp runs on Macs with Apple silicon (M1 or later) and macOS 12 or later. It is one self-contained app: nothing else needs to be installed, and it keeps no settings files.
+
+### Download
+
+1. Download `MacCleanUp-<version>.dmg` from [Releases](https://github.com/dominicferri/MacCleanUp/releases) and open it.
+2. Drag MacCleanUp onto Applications, or double-click it right in the disk image to run it without installing.
+
+To carry it on a thumb drive, copy the `.dmg` to the drive and open it on any Apple silicon Mac. A drive formatted as exFAT or FAT32 adds hidden `._` files to an app copied onto it directly; that copy still opens, but the disk image keeps the app exactly as it was signed.
+
+MacCleanUp is ad-hoc signed, not notarized. The first time you open a copy you downloaded, macOS may say it cannot verify the developer. Open System Settings, then Privacy & Security, and click Open Anyway.
+
+### Build from source
+
+The build needs Rust 1.85 or later (from [rustup](https://rustup.rs)), the Apple silicon target, and the Xcode Command Line Tools for `codesign` and `hdiutil`:
 
 ```sh
 xcode-select --install
-rustup target add aarch64-apple-darwin x86_64-apple-darwin
+rustup target add aarch64-apple-darwin
 git clone https://github.com/dominicferri/MacCleanUp.git
 cd MacCleanUp
-./scripts/build-app.sh
+./scripts/build-app.sh      # build/<version>/MacCleanUp.app
+./scripts/build-dmg.sh      # build/<version>/MacCleanUp-<version>.dmg
 ```
 
-The script builds a universal app for Apple Silicon and Intel. The app needs nothing else on the Mac that runs it: no Rust, no Homebrew, no other packages. It uses the Avenir Next fonts that ship with macOS.
-
-The app is ad-hoc signed, not notarized. If macOS blocks a copy that came from another Mac, open System Settings, then Privacy & Security, and click Open Anyway.
+The app is built for Apple silicon only. macOS 27 warns that apps carrying Intel code will not open in macOS 28, and every Mac that runs macOS 28 has Apple silicon.
 
 `MacCleanUp.app/Contents/MacOS/MacCleanUp --version` prints the version without opening a window.
 
@@ -59,7 +72,7 @@ A sidebar lists the views. Lists have a details panel on the right that shows wh
 - **Large old files:** files that use 1 GB or more on disk and have not changed for 180 days, anywhere in the home folder except `~/Library` and the Trash.
 - **Build folders:** Cargo `target` folders that contain `CACHEDIR.TAG`, and npm `node_modules` folders next to a `package.json`, anywhere in the home folder except `~/Library` and the Trash.
 - **Disk map:** the items in a folder drawn to scale as a treemap, with a sortable list below it. Click a tile or row for details; double-click a folder to open it. Use Up, the breadcrumb path, or the path field (`~` is accepted) to move around. Sizes of large folders are kept until you quit, so going back to a folder you already measured is fast. **Measure again** discards them, and any Trash operation discards the sizes it changed.
-- **System:** processor, macOS version, memory, startup disk use, load average, and uptime, updated every 2 seconds, plus the size of the Trash and the number of Time Machine local snapshots. If macOS does not let MacCleanUp read the Trash, the size shows as unavailable, not as zero.
+- **System:** processor, macOS version, memory, startup disk use, load average, and uptime, updated every 2 seconds, plus the size of the Trash and the number of Time Machine local snapshots. If macOS does not let MacCleanUp read the Trash, the size shows as unavailable, not as zero. A performance check lists any app or system process that averaged 80% or more of one processor core over the last 30 seconds (a result appears after 20 seconds on the page). It only reads CPU time; it never quits or pauses anything.
 - **Activity:** every Trash operation since the app opened, with each path that moved and any failures.
 
 Caches and Applications scan together when the app opens. Installer files, Large old files, Build folders, Disk map, and the storage measurement wait for a click, because they read Desktop, Documents, and Downloads, and macOS may ask MacCleanUp for access to those folders the first time. The searches do not open `~/Library`, the Trash, app bundles, or Photos libraries, and do not cross onto other volumes.
@@ -92,7 +105,7 @@ The review dialog lists every path that will move and its size. `Return` and `Es
 - Trash failures are reported item by item.
 - When macOS answers that MacCleanUp has no permission to move an item, MacCleanUp asks Finder to move that one item to the Trash. This can happen in a Documents or Desktop folder that cloud sync manages. Finder may ask for an administrator password when the item belongs to another user. Put Back still works. The path goes to the script as an argument, not as script text. The first time, macOS asks whether MacCleanUp may control Finder. MacCleanUp never runs itself as root: a move made as root would go to root's Trash, where Put Back does not work.
 - MacCleanUp does not terminate running apps. Close an app before removing its caches or uninstalling it.
-- The only other programs MacCleanUp starts are `tmutil listlocalsnapshots /` and `diskutil apfs list -plist`, which read the snapshot list and the volume sizes, `open` and `open -R` for the Finder buttons, and `osascript` for the Finder fallback above. It runs no shell cleanup scripts and no privileged commands.
+- The only other programs MacCleanUp starts are `tmutil listlocalsnapshots /` and `diskutil apfs list -plist`, which read the snapshot list and the volume sizes, `ps -A -o pid=,time=,comm=`, which reads CPU time for the performance check, `open` and `open -R` for the Finder buttons, and `osascript` for the Finder fallback above. It runs no shell cleanup scripts and no privileged commands, and it never signals, pauses or quits another process.
 
 ## Sizes and speed
 
@@ -108,7 +121,7 @@ cargo clippy --all-targets -- -D warnings
 ./scripts/build-app.sh
 ```
 
-The build creates `build/<version>/MacCleanUp.app` from a fresh staging folder, verifies its plist and ad-hoc signature, and checks that the binary contains `arm64` and `x86_64` slices. It refuses to overwrite an existing build of the same version.
+The build creates `build/<version>/MacCleanUp.app` from a fresh staging folder, verifies its plist and ad-hoc signature, and checks that the binary contains only `arm64` code. `build-dmg.sh` packs that app with an Applications shortcut and a short read-me into a compressed disk image, then mounts the image read-only to check the signature, the architecture and the version inside it. Both scripts refuse to overwrite an existing build of the same version.
 
 The interface tests run headless through `egui_kittest` and never open a window. Set `MACCLEANUP_SHOTS=<folder>` to save a PNG of each tested screen; the screenshots on this page come from those tests.
 
@@ -234,7 +247,7 @@ src/gui/mod.rs, src/gui/state.rs and src/scanner.rs are complex, and together th
 
 Mole 1.74.0 (GPL-3.0) supplied the behavior and safety requirements reviewed for this independent implementation. No Mole scripts or binaries are bundled or invoked.
 
-Version 0.4.4 does not implement Mole's Optimize, Purge, Slim, Touch ID, update, or administrator-only workflows.
+Version 0.4.5 does not implement Mole's Optimize maintenance tasks (it has only the read-only CPU check), Purge, Slim, Touch ID, update, or administrator-only workflows.
 
 ## License
 

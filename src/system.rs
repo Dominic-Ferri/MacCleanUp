@@ -7,10 +7,117 @@ use objc2_foundation::{
     NSPropertyListSerialization, NSString, NSURLVolumeAvailableCapacityForImportantUsageKey,
     NSURLVolumeAvailableCapacityKey, NSURL,
 };
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::mem::{size_of, MaybeUninit};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// CPU time each running process had used at one moment.
+#[derive(Clone, Debug)]
+pub struct CpuSample {
+    pub at: Instant,
+    /// Process ID to name and total CPU time, user plus system.
+    pub processes: HashMap<i32, (String, Duration)>,
+}
+
+/// Reads the CPU time of every process with `ps -A -o pid=,time=,comm=`.
+/// `/bin/ps` can read system processes that MacCleanUp itself cannot. It
+/// only reads: nothing is signalled, suspended or quit. MacCleanUp itself
+/// is left out. An empty sample means `ps` could not run.
+pub fn sample_processes() -> CpuSample {
+    let at = Instant::now();
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=,time=,comm="])
+        .output();
+    let processes = match output {
+        Ok(output) if output.status.success() => parse_ps(
+            &String::from_utf8_lossy(&output.stdout),
+            std::process::id() as i32,
+        ),
+        _ => HashMap::new(),
+    };
+    CpuSample { at, processes }
+}
+
+/// Parses `pid time command` lines. The command is a path that may contain
+/// spaces; the name is its last component.
+fn parse_ps(listing: &str, own: i32) -> HashMap<i32, (String, Duration)> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.trim_start().splitn(2, char::is_whitespace);
+            let pid: i32 = fields.next()?.parse().ok()?;
+            let rest = fields.next()?.trim_start();
+            let (time, command) = rest.split_once(char::is_whitespace)?;
+            let command = command.trim();
+            let name = command.rsplit('/').next().filter(|name| !name.is_empty())?;
+            let time = parse_cpu_time(time)?;
+            (pid != own).then(|| (pid, (name.to_string(), time)))
+        })
+        .collect()
+}
+
+/// `ps` prints CPU time as `[[dd-]hh:]mm:ss.cc`, where minutes may run past 59.
+fn parse_cpu_time(text: &str) -> Option<Duration> {
+    let (days, clock) = match text.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, text),
+    };
+    let parts: Vec<&str> = clock.split(':').collect();
+    let (hours, minutes, seconds) = match parts.as_slice() {
+        [minutes, seconds] => (0, minutes.parse::<u64>().ok()?, *seconds),
+        [hours, minutes, seconds] => (
+            hours.parse::<u64>().ok()?,
+            minutes.parse::<u64>().ok()?,
+            *seconds,
+        ),
+        _ => return None,
+    };
+    let seconds: f64 = seconds
+        .parse()
+        .ok()
+        .filter(|value: &f64| value.is_finite() && *value >= 0.0)?;
+    let whole = ((days * 24 + hours) * 60 + minutes) * 60;
+    Some(Duration::from_secs(whole) + Duration::from_secs_f64(seconds))
+}
+
+/// A process that kept the CPU busy for the whole window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HighCpu {
+    pub pid: i32,
+    pub name: String,
+    /// Average use over the window, in percent of one core.
+    pub percent: f64,
+}
+
+/// Processes whose average use between two samples is at least
+/// `threshold` percent of one core, busiest first. A process that exited
+/// or whose ID was reused for another name is left out.
+pub fn sustained_high_cpu(first: &CpuSample, last: &CpuSample, threshold: f64) -> Vec<HighCpu> {
+    let wall = last.at.saturating_duration_since(first.at).as_secs_f64();
+    if wall <= 0.0 {
+        return Vec::new();
+    }
+    let mut busy: Vec<HighCpu> = last
+        .processes
+        .iter()
+        .filter_map(|(pid, (name, after))| {
+            let (old_name, before) = first.processes.get(pid)?;
+            if old_name != name {
+                return None;
+            }
+            let percent = after.saturating_sub(*before).as_secs_f64() / wall * 100.0;
+            (percent >= threshold).then(|| HighCpu {
+                pid: *pid,
+                name: name.clone(),
+                percent,
+            })
+        })
+        .collect();
+    busy.sort_by(|a, b| b.percent.total_cmp(&a.percent));
+    busy
+}
 
 /// Read-only storage figures that take longer than the 2-second metrics.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -560,6 +667,75 @@ mod tests {
         assert!(status.load_average.is_some());
         let swap = status.swap.expect("swap metrics");
         assert!(swap.used <= swap.total);
+    }
+
+    #[test]
+    fn sustained_cpu_is_the_average_over_the_window() {
+        let start = Instant::now();
+        let sample = |offset: u64, processes: &[(i32, &str, u64)]| CpuSample {
+            at: start + Duration::from_secs(offset),
+            processes: processes
+                .iter()
+                .map(|(pid, name, ms)| (*pid, (name.to_string(), Duration::from_millis(*ms))))
+                .collect(),
+        };
+        let first = sample(
+            0,
+            &[
+                (10, "busy", 0),
+                (11, "idle", 0),
+                (12, "old", 0),
+                (13, "two", 0),
+            ],
+        );
+        // Over 30 s: busy used 45 s of CPU (150%), idle 3 s (10%), two 27 s
+        // (90%); pid 12 now belongs to another program; pid 14 is new.
+        let last = sample(
+            30,
+            &[
+                (10, "busy", 45_000),
+                (11, "idle", 3_000),
+                (12, "reused", 60_000),
+                (13, "two", 27_000),
+                (14, "new", 90_000),
+            ],
+        );
+        let busy = sustained_high_cpu(&first, &last, 80.0);
+        let names: Vec<_> = busy.iter().map(|high| high.name.as_str()).collect();
+        assert_eq!(names, ["busy", "two"]);
+        assert!((busy[0].percent - 150.0).abs() < 0.01);
+        assert!((busy[1].percent - 90.0).abs() < 0.01);
+        assert!(sustained_high_cpu(&first, &first, 80.0).is_empty());
+    }
+
+    #[test]
+    fn live_process_samples_include_system_processes_but_not_this_one() {
+        let sample = sample_processes();
+        assert!(sample.processes.len() > 5, "{}", sample.processes.len());
+        assert!(!sample.processes.contains_key(&(std::process::id() as i32)));
+        let (name, _) = sample.processes.get(&1).expect("pid 1 is root's launchd");
+        assert_eq!(name, "launchd");
+        let parent = std::os::unix::process::parent_id() as i32;
+        assert!(sample.processes.contains_key(&parent));
+    }
+
+    #[test]
+    fn ps_cpu_times_and_lines_parse() {
+        let secs = |text| parse_cpu_time(text).map(|time| time.as_secs_f64());
+        assert_eq!(secs("0:01.50"), Some(1.5));
+        assert_eq!(secs("7:38.42"), Some(458.42));
+        assert_eq!(secs("125:00.00"), Some(7_500.0));
+        assert_eq!(secs("1:02:03.04"), Some(3_723.04));
+        assert_eq!(secs("2-01:00:00.00"), Some(176_400.0));
+        for bad in ["", "abc", "1:2:3:4", "x:01.00", "1-", "0:-1.00"] {
+            assert_eq!(parse_cpu_time(bad), None, "{bad:?}");
+        }
+        let listing = "    1   7:38.42 /sbin/launchd\n  300   0:01.00 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper (Renderer)\n  42   0:00.10 /usr/bin/self\nnot a line\n";
+        let parsed = parse_ps(listing, 42);
+        assert_eq!(parsed.len(), 2, "own pid and the bad line are left out");
+        assert_eq!(parsed[&1].0, "launchd");
+        assert_eq!(parsed[&300].0, "Google Chrome Helper (Renderer)");
+        assert_eq!(parsed[&300].1, Duration::from_secs(1));
     }
 
     #[test]

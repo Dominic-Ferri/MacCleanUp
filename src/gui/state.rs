@@ -9,15 +9,23 @@ use maccleanup::scanner::{
     scan_installers, scan_large_files, DiskScan, ScanResult, SizeCache, LARGE_FILE_AGE,
     LARGE_FILE_BYTES,
 };
-use maccleanup::system::{self, Breakdown, StorageExtras, SystemStatus, VolumeUsage};
+use maccleanup::system::{
+    self, Breakdown, CpuSample, HighCpu, StorageExtras, SystemStatus, VolumeUsage,
+};
 use maccleanup::trash::{related_app_data, trash_apps, trash_disk_item, trash_items};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 pub const STATUS_REFRESH: Duration = Duration::from_secs(2);
+
+/// The performance check averages CPU use over this window, needs at least
+/// `CPU_MIN_WINDOW` of it, and flags processes at or above this share of a core.
+pub const CPU_WINDOW: Duration = Duration::from_secs(30);
+pub const CPU_MIN_WINDOW: Duration = Duration::from_secs(20);
+pub const CPU_BUSY_PERCENT: f64 = 80.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Section {
@@ -190,6 +198,8 @@ pub struct State {
     pub sort: [SortKey; Section::COUNT],
     pub filter: [String; Section::COUNT],
     pub status: Option<SystemStatus>,
+    /// CPU time samples from the last half minute, for the performance check.
+    pub cpu_samples: VecDeque<CpuSample>,
     pub extras: Option<StorageExtras>,
     /// Per-volume use of the startup disk, read with the Overview scan.
     pub volumes: Option<VolumeUsage>,
@@ -248,6 +258,7 @@ impl State {
             sort: [SortKey::Size; Section::COUNT],
             filter: Default::default(),
             status: None,
+            cpu_samples: VecDeque::new(),
             extras: None,
             volumes: None,
             breakdown: None,
@@ -369,6 +380,29 @@ impl State {
     pub fn read_status(&mut self) {
         self.status = Some(system::collect());
         self.status_read_at = Some(Instant::now());
+        self.cpu_samples.push_back(system::sample_processes());
+        while self
+            .cpu_samples
+            .front()
+            .is_some_and(|oldest| oldest.at.elapsed() > CPU_WINDOW + STATUS_REFRESH)
+        {
+            self.cpu_samples.pop_front();
+        }
+    }
+
+    /// Processes that averaged at least 80% of one core over the samples
+    /// kept, busiest first, with the window length. None until the samples
+    /// span 20 seconds.
+    pub fn cpu_check(&self) -> Option<(Vec<HighCpu>, Duration)> {
+        let (oldest, newest) = (self.cpu_samples.front()?, self.cpu_samples.back()?);
+        let window = newest.at.saturating_duration_since(oldest.at);
+        if window < CPU_MIN_WINDOW || newest.processes.is_empty() {
+            return None;
+        }
+        Some((
+            system::sustained_high_cpu(oldest, newest, CPU_BUSY_PERCENT),
+            window,
+        ))
     }
 
     pub fn can_start(&self) -> bool {
@@ -1126,6 +1160,34 @@ mod tests {
         assert!(!state.is_stopped(Section::Clean));
         wait_idle(&mut state);
         assert!(state.is_loaded(Section::Clean));
+    }
+
+    #[test]
+    fn cpu_check_waits_for_twenty_seconds_then_names_busy_processes() {
+        let mut state = State::new(fixture_home());
+        assert_eq!(state.cpu_check(), None, "no samples yet");
+        let now = Instant::now();
+        let sample = |ago: u64, busy_ms: u64| CpuSample {
+            at: now - Duration::from_secs(ago),
+            processes: [
+                (7, ("Indexer".to_string(), Duration::from_millis(busy_ms))),
+                (
+                    8,
+                    ("Quiet".to_string(), Duration::from_millis(busy_ms / 100)),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        state.cpu_samples = [sample(10, 0), sample(0, 10_000)].into_iter().collect();
+        assert_eq!(state.cpu_check(), None, "10 s is not enough");
+        // 30 s window: Indexer used 27 s of CPU (90%), Quiet 0.27 s.
+        state.cpu_samples = [sample(30, 0), sample(0, 27_000)].into_iter().collect();
+        let (busy, window) = state.cpu_check().unwrap();
+        assert_eq!(window, Duration::from_secs(30));
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0].name, "Indexer");
+        assert!((busy[0].percent - 90.0).abs() < 0.01);
     }
 
     #[test]

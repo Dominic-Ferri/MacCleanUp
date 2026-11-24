@@ -101,7 +101,9 @@ impl MacCleanUp {
                 }
                 Section::Storage => self.storage_page(ui),
                 Section::Disk => self.disk_page(ui),
-                Section::Status => self.status_page(ui),
+                Section::Status => {
+                    egui::ScrollArea::vertical().show(ui, |ui| self.status_page(ui));
+                }
                 Section::Activity => self.activity_page(ui),
                 _ => self.list_page(ui),
             });
@@ -1045,6 +1047,67 @@ impl MacCleanUp {
                 "Copies of the startup disk that macOS keeps between backups. macOS removes them by itself when it needs the space.",
             );
         });
+        ui.add_space(14.0);
+        self.performance_check(ui);
+    }
+
+    /// Apps that kept the processor busy for the last half minute. It reads
+    /// CPU time only and never quits or signals a process.
+    fn performance_check(&self, ui: &mut Ui) {
+        ui.label(
+            RichText::new("Performance check")
+                .font(condensed(20.0))
+                .color(CHALK),
+        );
+        ui.add_space(4.0);
+        let Some((busy, window)) = self.state.cpu_check() else {
+            ui.label(
+                RichText::new("Watching CPU use. A result appears after 20 seconds on this page.")
+                    .color(SILT),
+            );
+            return;
+        };
+        let seconds = window.as_secs();
+        if busy.is_empty() {
+            ui.label(
+                RichText::new(format!(
+                    "No app used more than {:.0}% of a processor core for the last {seconds} seconds.",
+                    state::CPU_BUSY_PERCENT
+                ))
+                .color(SILT),
+            );
+            return;
+        }
+        ui.label(
+            RichText::new(format!(
+                "These kept the processor busy for the last {seconds} seconds:"
+            ))
+            .color(SILT),
+        );
+        ui.add_space(4.0);
+        for high in busy.iter().take(8) {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&high.name).color(CHALK));
+                ui.label(
+                    RichText::new(format!("process {}", high.pid))
+                        .small()
+                        .color(SILT),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{:.0}% of a core", high.percent))
+                            .font(medium(13.0))
+                            .color(ORE),
+                    );
+                });
+            });
+        }
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("MacCleanUp never quits apps. If one should not be this busy, quit it from the app itself or from Activity Monitor.")
+                .small()
+                .color(SILT),
+        );
     }
 
     // Activity --------------------------------------------------------------
@@ -2774,6 +2837,21 @@ mod tests {
         harness.run_steps(2);
         harness.get_by_label("Memory in use");
         harness.get_by_label("Load average");
+        harness.get_by_label_contains("Watching CPU use");
+        // Two samples 30 s apart: one process used 36 s of CPU (120%).
+        let now = std::time::Instant::now();
+        let sample = |ago: u64, ms: u64| maccleanup::system::CpuSample {
+            at: now - Duration::from_secs(ago),
+            processes: [(4242, ("mds_stores".to_string(), Duration::from_millis(ms)))]
+                .into_iter()
+                .collect(),
+        };
+        harness.state_mut().state.cpu_samples =
+            [sample(30, 0), sample(0, 36_000)].into_iter().collect();
+        harness.run_steps(2);
+        harness.get_by_label("mds_stores");
+        harness.get_by_label("120% of a core");
+        harness.get_by_label_contains("MacCleanUp never quits apps");
         shot(&mut harness, "system");
         nav(&mut harness, "Activity");
         harness.run_steps(2);
